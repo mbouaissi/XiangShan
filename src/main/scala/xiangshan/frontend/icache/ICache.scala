@@ -544,6 +544,8 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle {
   // memblock
   val softPrefetch: Vec[Valid[SoftIfetchPrefetchBundle]] =
     Vec(backendParams.LduCnt, Flipped(Valid(new SoftIfetchPrefetchBundle)))
+  // IFU - ROB commits for FEC tracking
+  val rob_commits: Vec[Valid[RobCommitInfo]] = Input(Vec(CommitWidth, Valid(new RobCommitInfo)))
   // IFU
   val stop:  Bool = Input(Bool())
   val toIFU: Bool = Output(Bool())
@@ -608,6 +610,7 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   private val replacer   = Module(new ICacheReplacer)
   private val prefetcher = Module(new IPrefetchPipe)
   private val wayLookup  = Module(new WayLookup)
+  private val fecTracker = Module(new FECTracker(numEntries = 16))
 
   private val ecc_enable = if (outer.ctrlUnitOpt.nonEmpty) outer.ctrlUnitOpt.get.module.io.ecc_enable else true.B
 
@@ -715,6 +718,26 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   io.itlb(0) <> prefetcher.io.itlb(0)
   io.itlb(1) <> prefetcher.io.itlb(1)
   io.itlbFlushPipe := prefetcher.io.itlbFlushPipe
+
+  // FEC Tracker connections
+  fecTracker.io.newMiss       := prefetcher.io.newMiss
+  // Convert mainPipe stall info to tracker format
+  // Any valid stall from either port indicates the FTQ entry is stalled
+  private val anyStall = mainPipe.io.fetch.stallInfo.map(_.valid).reduce(_ || _)
+  fecTracker.io.stallUpdate.valid       := anyStall
+  fecTracker.io.stallUpdate.bits.ftqIdx := Mux(
+    mainPipe.io.fetch.stallInfo(0).valid,
+    mainPipe.io.fetch.stallInfo(0).bits.ftqIdx,
+    mainPipe.io.fetch.stallInfo(1).bits.ftqIdx
+  )
+  fecTracker.io.stallUpdate.bits.stalled := true.B
+  // Forward ROB commits for retirement tracking  
+  // Convert Vec[Valid[RobCommitInfo]] to Vec[Valid[FtqPtr]]
+  (0 until CommitWidth).foreach { i =>
+    fecTracker.io.retireUpdate(i).valid       := io.rob_commits(i).valid
+    fecTracker.io.retireUpdate(i).bits.ftqIdx := io.rob_commits(i).bits.ftqIdx
+  }
+  fecTracker.io.flush         := io.flush
 
   // notify IFU that Icache pipeline is available
   io.toIFU    := mainPipe.io.fetch.req.ready

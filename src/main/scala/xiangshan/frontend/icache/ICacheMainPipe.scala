@@ -53,6 +53,8 @@ class ICacheMainPipeBundle(implicit p: Parameters) extends ICacheBundle {
   val resp:              Valid[ICacheMainPipeResp]             = ValidIO(new ICacheMainPipeResp)
   val topdownIcacheMiss: Bool                                  = Output(Bool())
   val topdownItlbMiss:   Bool                                  = Output(Bool())
+  // FEC tracking: notify when stall occurs due to cache miss
+  val stallInfo:         Vec[Valid[FECStallInfo]]              = Vec(PortNumber, ValidIO(new FECStallInfo))
 }
 
 class ICacheMetaReqBundle(implicit p: Parameters) extends ICacheBundle {
@@ -177,6 +179,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
   private val s0_req_vaddr   = s0_req_vaddr_all.last
   private val s0_req_vSetIdx = s0_req_vSetIdx_all.last
   private val s0_doubleline  = s0_doubleline_all.last
+  private val s0_req_ftqIdx  = fromFtqReq(partWayNum).ftqIdx
 
   private val s0_backendException = fromFtq.bits.backendException
 
@@ -242,6 +245,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
   private val s1_req_gpaddr = RegEnable(s0_req_gpaddr, 0.U.asTypeOf(s0_req_gpaddr), s0_fire)
   private val s1_req_isForVSnonLeafPTE =
     RegEnable(s0_req_isForVSnonLeafPTE, 0.U.asTypeOf(s0_req_isForVSnonLeafPTE), s0_fire)
+  private val s1_req_ftqIdx       = RegEnable(s0_req_ftqIdx, 0.U.asTypeOf(s0_req_ftqIdx), s0_fire)
   private val s1_doubleline       = RegEnable(s0_doubleline, 0.U.asTypeOf(s0_doubleline), s0_fire)
   private val s1_SRAMhits         = RegEnable(s0_hits, 0.U.asTypeOf(s0_hits), s0_fire)
   private val s1_itlb_exception   = RegEnable(s0_itlb_exception, 0.U.asTypeOf(s0_itlb_exception), s0_fire)
@@ -351,6 +355,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
   private val s2_req_gpaddr = RegEnable(s1_req_gpaddr, 0.U.asTypeOf(s1_req_gpaddr), s1_fire)
   private val s2_req_isForVSnonLeafPTE =
     RegEnable(s1_req_isForVSnonLeafPTE, 0.U.asTypeOf(s1_req_isForVSnonLeafPTE), s1_fire)
+  private val s2_req_ftqIdx       = RegEnable(s1_req_ftqIdx, 0.U.asTypeOf(s1_req_ftqIdx), s1_fire)
   private val s2_doubleline       = RegEnable(s1_doubleline, 0.U.asTypeOf(s1_doubleline), s1_fire)
   private val s2_exception        = RegEnable(s1_exception_out, 0.U.asTypeOf(s1_exception_out), s1_fire)
   private val s2_backendException = RegEnable(s1_backendException, false.B, s1_fire)
@@ -594,6 +599,13 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
 
   io.fetch.topdownIcacheMiss := !s2_fetch_finish
   io.fetch.topdownItlbMiss   := s0_valid && !fromWayLookup.ready
+
+  // FEC tracking: emit stall info when cache miss causes stall
+  (0 until PortNumber).foreach { i =>
+    io.fetch.stallInfo(i).valid        := s2_valid && s2_should_fetch(i) && !s2_flush
+    io.fetch.stallInfo(i).bits.ftqIdx  := s2_req_ftqIdx
+    io.fetch.stallInfo(i).bits.stalled := true.B // This is a stall
+  }
 
   // class ICacheTouchDB(implicit p: Parameters) extends ICacheBundle{
   //   val blkPaddr  = UInt((PAddrBits - blockOffBits).W)

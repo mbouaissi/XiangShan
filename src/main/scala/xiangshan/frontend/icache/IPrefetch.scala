@@ -68,6 +68,9 @@ class IPrefetchIO(implicit p: Parameters) extends IPrefetchBundle {
   val MSHRReq:        DecoupledIO[ICacheMissReq] = DecoupledIO(new ICacheMissReq)
   val MSHRResp:       Valid[ICacheMissResp]      = Flipped(ValidIO(new ICacheMissResp))
   val wayLookupWrite: DecoupledIO[WayLookupInfo] = DecoupledIO(new WayLookupInfo)
+  
+  // FEC tracking: notify when a new miss occurs
+  val newMiss:        Valid[FECMissInfo]         = ValidIO(new FECMissInfo)
 }
 
 class IPrefetchPipe(implicit p: Parameters) extends IPrefetchModule with HasICacheECCHelper {
@@ -496,6 +499,7 @@ class IPrefetchPipe(implicit p: Parameters) extends IPrefetchModule with HasICac
 
   private val s2_req_vaddr      = RegEnable(s1_req_vaddr, 0.U.asTypeOf(s1_req_vaddr), s1_real_fire)
   private val s2_isSoftPrefetch = RegEnable(s1_isSoftPrefetch, 0.U.asTypeOf(s1_isSoftPrefetch), s1_real_fire)
+  private val s2_req_ftqIdx     = RegEnable(s1_req_ftqIdx, 0.U.asTypeOf(s1_req_ftqIdx), s1_real_fire)
   private val s2_doubleline     = RegEnable(s1_doubleline, 0.U.asTypeOf(s1_doubleline), s1_real_fire)
   private val s2_req_paddr      = RegEnable(s1_req_paddr, 0.U.asTypeOf(s1_req_paddr), s1_real_fire)
   private val s2_exception =
@@ -550,6 +554,7 @@ class IPrefetchPipe(implicit p: Parameters) extends IPrefetchModule with HasICac
    * mmio should not be prefetched
    * also, if previous has exception, latter port should also not be prefetched
    */
+   //EPIP Cache miss detection
   private val s2_miss = VecInit((0 until PortNumber).map { i =>
     !s2_hits(i) && (if (i == 0) true.B else s2_doubleline) &&
     !ExceptionType.hasException(s2_exception.take(i + 1)) &&
@@ -580,6 +585,12 @@ class IPrefetchPipe(implicit p: Parameters) extends IPrefetchModule with HasICac
   }
 
   toMSHR <> toMSHRArbiter.io.out
+
+  // FEC tracking: notify when a new miss is sent to MSHR
+  io.newMiss.valid          := toMSHR.fire
+  io.newMiss.bits.blkPaddr  := toMSHR.bits.blkPaddr
+  io.newMiss.bits.vSetIdx   := toMSHR.bits.vSetIdx
+  io.newMiss.bits.ftqIdx    := s2_req_ftqIdx
 
   s2_flush := io.flush
 

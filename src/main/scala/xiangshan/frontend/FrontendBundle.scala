@@ -82,6 +82,8 @@ class IFUICacheIO(implicit p: Parameters) extends XSBundle with HasICacheParamet
   val resp              = ValidIO(new ICacheMainPipeResp)
   val topdownIcacheMiss = Output(Bool())
   val topdownItlbMiss   = Output(Bool())
+  // FEC tracking: forward ROB commits for retirement tracking
+  val rob_commits       = Input(Vec(CommitWidth, Valid(new RobCommitInfo)))
 }
 
 class FtqToICacheRequestBundle(implicit p: Parameters) extends XSBundle with HasICacheParameters {
