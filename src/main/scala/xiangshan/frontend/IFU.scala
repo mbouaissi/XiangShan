@@ -374,6 +374,9 @@ class NewIFU(implicit p: Parameters) extends XSModule
   icacheMissBubble := io.icacheInter.topdownIcacheMiss
   itlbMissBubble   := io.icacheInter.topdownItlbMiss
 
+  // FEC tracking: forward ROB commits to ICache for retirement tracking
+  io.icacheInter.rob_commits := io.rob_commits
+
   io.icacheStop := !f3_ready
 
   when(f2_flush)(f2_icache_all_resp_reg := false.B)

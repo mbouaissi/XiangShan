@@ -1,0 +1,13 @@
+SET XS_PROJECT_ROOT: /raid1/menzo/xs-env
+SET NOOP_HOME (XiangShan RTL Home): /raid1/menzo/xs-env/XiangShan
+SET NEMU_HOME: /raid1/menzo/xs-env/NEMU
+SET AM_HOME: /raid1/menzo/xs-env/nexus-am
+SET DRAMSIM3_HOME: /raid1/menzo/xs-env/DRAMsim3
+emu compiled at Feb 20 2026, 13:43:44
+Using simulated 32768B flash
+Using simulated 8386560MB RAM
+The image is ready-to-run/microbench.bin
+The reference model is ready-to-run/riscv64-nemu-interpreter-so
+The first instruction of core 0 has commited. Difftest enabled. 
+======= Running MicroBench [input *test*] =======
+[qsort] Quick sort: 
