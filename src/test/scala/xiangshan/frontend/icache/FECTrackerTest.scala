@@ -1,18 +1,4 @@
-/***************************************************************************************
-* Copyright (c) 2024 Beijing Institute of Open Source Chip (BOSC)
-* Copyright (c) 2020-2024 Institute of Computing Technology, Chinese Academy of Sciences
-*
-* XiangShan is licensed under Mulan PSL v2.
-* You can use this software according to the terms and conditions of the Mulan PSL v2.
-* You may obtain a copy of Mulan PSL v2 at:
-*          http://license.coscl.org.cn/MulanPSL2
-*
-* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
-* EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
-* MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
-*
-* See the Mulan PSL v2 for more details.
-***************************************************************************************/
+
 
 package xiangshan.frontend.icache
 
@@ -213,13 +199,24 @@ class FECTrackerTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       }
       dut.clock.step(1)
 
-      // At least one should be detected
-      val fecDetected = dut.io.fecLine.valid.peek().litToBoolean
-      println(s"[Multiple Commits Test] FEC detected: ${fecDetected}")
+      // Should detect at least one FEC line (one per cycle max)
+      val fecDetected1 = dut.io.fecLine.valid.peek().litToBoolean
+      val detectedAddr1 = if (fecDetected1) Some(dut.io.fecLine.bits.blkPaddr.peek().litValue) else None
+      println(s"[Multiple Commits Test] First cycle FEC detected: ${fecDetected1}, addr: ${detectedAddr1}")
       
       (0 until 6).foreach { i =>
         dut.io.retireUpdate(i).valid.poke(false.B)
       }
+      dut.clock.step(1)
+      
+      // Check for additional FEC detections in subsequent cycles
+      val fecDetected2 = dut.io.fecLine.valid.peek().litToBoolean
+      val detectedAddr2 = if (fecDetected2) Some(dut.io.fecLine.bits.blkPaddr.peek().litValue) else None
+      println(s"[Multiple Commits Test] Second cycle FEC detected: ${fecDetected2}, addr: ${detectedAddr2}")
+      
+      // At least one of the three entries should have been detected as FEC
+      assert(fecDetected1 || fecDetected2, "At least one FEC line should be detected from multiple commits")
+      
       dut.clock.step(1)
     }
   }
@@ -288,7 +285,7 @@ class FECTrackerTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       for (i <- 0 until 6) { // Try to allocate more than capacity
         dut.io.newMiss.valid.poke(true.B)
         dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
-        dut.io.newMiss.bits.ftqIdx.value.poke((60 + i).U)
+        dut.io.newMiss.bits.ftqIdx.value.poke((55 + i).U) // 55-60 all within 0-63 range
         dut.io.newMiss.bits.blkPaddr.poke((0x6000 + i * 0x100).U)
         dut.io.newMiss.bits.vSetIdx.poke((0x60 + i).U)
         dut.clock.step(1)
@@ -298,13 +295,22 @@ class FECTrackerTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       println(s"[Tracker Full Test] Attempted to allocate 6 entries in 4-entry tracker")
       
       // Check performance counter for tracker full events
-      dut.clock.step(5)
-      println(s"[Tracker Full Test] Tracker should have hit capacity limits")
+      dut.clock.step(2)
+      val trackerFullCount = dut.io.perfInfo.trackerFull.peek().litValue
+      println(s"[Tracker Full Test] Tracker full count: ${trackerFullCount}")
+      
+      // Should have at least 2 tracker full events (6 attempts - 4 capacity)
+      assert(trackerFullCount >= 2, s"Expected at least 2 tracker full events, got ${trackerFullCount}")
+      
+      // Verify only first 4 entries were actually tracked
+      val totalMisses = dut.io.perfInfo.totalMisses.peek().litValue
+      assert(totalMisses == 4, s"Expected 4 misses tracked in 4-entry tracker, got ${totalMisses}")
     }
   }
 
   it should "age out old entries" in {
-    test(new FECTracker(numEntries = 16)) { dut =>
+    test(new FECTracker(numEntries = 16)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
+      dut.clock.setTimeout(2000) // Increase timeout for aging test
       dut.io.flush.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
@@ -366,19 +372,209 @@ class FECTrackerTest extends AnyFlatSpec with ChiselScalatestTester with Matcher
       for (i <- 0 until 3) {
         dut.io.newMiss.valid.poke(true.B)
         dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
-        dut.io.newMiss.bits.ftqIdx.value.poke((30 + i).U)
+        dut.io.newMiss.bits.ftqIdx.value.poke((20 + i).U) // 20-22 within 0-63 range
         dut.io.newMiss.bits.blkPaddr.poke((0x8000 + i * 0x100).U)
-        dut.io.newMiss.bits.vSetIdx.poke((0x30 + i).U)
+        dut.io.newMiss.bits.vSetIdx.poke((0x20 + i).U)
         dut.clock.step(1)
       }
       dut.io.newMiss.valid.poke(false.B)
       dut.clock.step(1)
 
       val finalTotalMisses = dut.io.perfInfo.totalMisses.peek().litValue
+      val missesWithStall = dut.io.perfInfo.missesWithStall.peek().litValue
+      val fecLinesDetected = dut.io.perfInfo.fecLinesDetected.peek().litValue
+      val trackerFull = dut.io.perfInfo.trackerFull.peek().litValue
+      
       println(s"[Perf Test] Final total misses: ${finalTotalMisses}")
-      println(s"[Perf Test] Misses with stall: ${dut.io.perfInfo.missesWithStall.peek().litValue}")
-      println(s"[Perf Test] FEC lines detected: ${dut.io.perfInfo.fecLinesDetected.peek().litValue}")
-      println(s"[Perf Test] Tracker full count: ${dut.io.perfInfo.trackerFull.peek().litValue}")
+      println(s"[Perf Test] Misses with stall: ${missesWithStall}")
+      println(s"[Perf Test] FEC lines detected: ${fecLinesDetected}")
+      println(s"[Perf Test] Tracker full count: ${trackerFull}")
+      
+      // Validate counter correctness
+      assert(finalTotalMisses == 3, s"Expected 3 total misses, got ${finalTotalMisses}")
+      assert(finalTotalMisses >= initialTotalMisses, "Total misses should not decrease")
+      assert(missesWithStall <= finalTotalMisses, "Misses with stall cannot exceed total misses")
+      assert(fecLinesDetected <= missesWithStall, "FEC lines cannot exceed misses with stall")
+      assert(trackerFull == 0, "No tracker overflow in this test")
+    }
+  }
+
+  it should "handle event ordering: stall before miss" in {
+    test(new FECTracker(numEntries = 16)) { dut =>
+      dut.io.flush.poke(false.B)
+      dut.io.newMiss.valid.poke(false.B)
+      dut.io.stallUpdate.valid.poke(false.B)
+      (0 until 6).foreach { i =>
+        dut.io.retireUpdate(i).valid.poke(false.B)
+      }
+      dut.clock.step(1)
+
+      val testFtqIdx = 12.U
+
+      // Report stall BEFORE miss (should be ignored until miss arrives)
+      dut.io.stallUpdate.valid.poke(true.B)
+      dut.io.stallUpdate.bits.ftqIdx.flag.poke(false.B)
+      dut.io.stallUpdate.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.stallUpdate.bits.stalled.poke(true.B)
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(false.B)
+      println(s"[Event Order Test] Stall reported before miss")
+
+      // Now report the miss
+      dut.clock.step(2)
+      dut.io.newMiss.valid.poke(true.B)
+      dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
+      dut.io.newMiss.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.newMiss.bits.blkPaddr.poke(0xa000.U)
+      dut.io.newMiss.bits.vSetIdx.poke(0xa0.U)
+      dut.clock.step(1)
+      dut.io.newMiss.valid.poke(false.B)
+      println(s"[Event Order Test] Miss reported after stall")
+
+      // Report stall again (entry now exists)
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(true.B)
+      dut.io.stallUpdate.bits.ftqIdx.flag.poke(false.B)
+      dut.io.stallUpdate.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.stallUpdate.bits.stalled.poke(true.B)
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(false.B)
+
+      // Retire and check FEC
+      dut.clock.step(1)
+      dut.io.retireUpdate(0).valid.poke(true.B)
+      dut.io.retireUpdate(0).bits.ftqIdx.flag.poke(false.B)
+      dut.io.retireUpdate(0).bits.ftqIdx.value.poke(testFtqIdx)
+      dut.clock.step(1)
+
+      val fecDetected = dut.io.fecLine.valid.peek().litToBoolean
+      println(s"[Event Order Test] FEC detected: ${fecDetected} (should be true)")
+      assert(fecDetected, "FEC should be detected even when stall arrives before miss")
+
+      dut.io.retireUpdate(0).valid.poke(false.B)
+      dut.clock.step(1)
+    }
+  }
+
+  it should "handle duplicate misses for same line" in {
+    test(new FECTracker(numEntries = 16)) { dut =>
+      dut.io.flush.poke(false.B)
+      dut.io.newMiss.valid.poke(false.B)
+      dut.io.stallUpdate.valid.poke(false.B)
+      (0 until 6).foreach { i =>
+        dut.io.retireUpdate(i).valid.poke(false.B)
+      }
+      dut.clock.step(1)
+
+      val testFtqIdx = 15.U
+      val testBlkPaddr = 0xb000.U
+      val testVSetIdx = 0xb0.U
+
+      // First miss
+      dut.io.newMiss.valid.poke(true.B)
+      dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
+      dut.io.newMiss.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.newMiss.bits.blkPaddr.poke(testBlkPaddr)
+      dut.io.newMiss.bits.vSetIdx.poke(testVSetIdx)
+      dut.clock.step(1)
+      dut.io.newMiss.valid.poke(false.B)
+      println(s"[Duplicate Test] First miss reported")
+
+      val perfMisses1 = dut.io.perfInfo.totalMisses.peek().litValue
+
+      // Duplicate miss for same FTQ entry (should update, not allocate new)
+      dut.clock.step(2)
+      dut.io.newMiss.valid.poke(true.B)
+      dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
+      dut.io.newMiss.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.newMiss.bits.blkPaddr.poke(testBlkPaddr)
+      dut.io.newMiss.bits.vSetIdx.poke(testVSetIdx)
+      dut.clock.step(1)
+      dut.io.newMiss.valid.poke(false.B)
+      println(s"[Duplicate Test] Duplicate miss reported")
+
+      val perfMisses2 = dut.io.perfInfo.totalMisses.peek().litValue
+
+      // Both misses should be counted
+      assert(perfMisses2 == perfMisses1 + 1, s"Expected ${perfMisses1 + 1} total misses, got ${perfMisses2}")
+
+      // Complete FEC lifecycle
+      dut.io.stallUpdate.valid.poke(true.B)
+      dut.io.stallUpdate.bits.ftqIdx.flag.poke(false.B)
+      dut.io.stallUpdate.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.stallUpdate.bits.stalled.poke(true.B)
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(false.B)
+
+      dut.clock.step(1)
+      dut.io.retireUpdate(0).valid.poke(true.B)
+      dut.io.retireUpdate(0).bits.ftqIdx.flag.poke(false.B)
+      dut.io.retireUpdate(0).bits.ftqIdx.value.poke(testFtqIdx)
+      dut.clock.step(1)
+
+      val fecDetected = dut.io.fecLine.valid.peek().litToBoolean
+      println(s"[Duplicate Test] FEC detected: ${fecDetected}")
+      assert(fecDetected, "FEC should be detected after duplicate miss handling")
+
+      dut.io.retireUpdate(0).valid.poke(false.B)
+      dut.clock.step(1)
+    }
+  }
+
+  it should "handle stall clear (stalled=false)" in {
+    test(new FECTracker(numEntries = 16)) { dut =>
+      dut.io.flush.poke(false.B)
+      dut.io.newMiss.valid.poke(false.B)
+      dut.io.stallUpdate.valid.poke(false.B)
+      (0 until 6).foreach { i =>
+        dut.io.retireUpdate(i).valid.poke(false.B)
+      }
+      dut.clock.step(1)
+
+      val testFtqIdx = 18.U
+
+      // Report miss
+      dut.io.newMiss.valid.poke(true.B)
+      dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
+      dut.io.newMiss.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.newMiss.bits.blkPaddr.poke(0xc000.U)
+      dut.io.newMiss.bits.vSetIdx.poke(0xc0.U)
+      dut.clock.step(1)
+      dut.io.newMiss.valid.poke(false.B)
+
+      // Report stall
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(true.B)
+      dut.io.stallUpdate.bits.ftqIdx.flag.poke(false.B)
+      dut.io.stallUpdate.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.stallUpdate.bits.stalled.poke(true.B)
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(false.B)
+      println(s"[Stall Clear Test] Stall set to true")
+
+      // Clear stall (stalled=false) before retire
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(true.B)
+      dut.io.stallUpdate.bits.ftqIdx.flag.poke(false.B)
+      dut.io.stallUpdate.bits.ftqIdx.value.poke(testFtqIdx)
+      dut.io.stallUpdate.bits.stalled.poke(false.B)
+      dut.clock.step(1)
+      dut.io.stallUpdate.valid.poke(false.B)
+      println(s"[Stall Clear Test] Stall set to false")
+
+      // Retire - should NOT detect FEC since stall was cleared
+      dut.clock.step(1)
+      dut.io.retireUpdate(0).valid.poke(true.B)
+      dut.io.retireUpdate(0).bits.ftqIdx.flag.poke(false.B)
+      dut.io.retireUpdate(0).bits.ftqIdx.value.poke(testFtqIdx)
+      dut.clock.step(1)
+
+      val fecDetected = dut.io.fecLine.valid.peek().litToBoolean
+      println(s"[Stall Clear Test] FEC detected: ${fecDetected} (should be false)")
+      assert(!fecDetected, "FEC should NOT be detected when stall is cleared before retire")
+
+      dut.io.retireUpdate(0).valid.poke(false.B)
+      dut.clock.step(1)
     }
   }
 }

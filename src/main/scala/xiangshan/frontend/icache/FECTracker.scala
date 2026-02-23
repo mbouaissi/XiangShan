@@ -93,16 +93,23 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   )
 
   // FEC detection state (must be defined before fireFEC uses them)
-  private val fecDetected = WireInit(false.B)
-  private val fecDetectedIdx = WireInit(0.U(log2Ceil(numEntries).W))
-  private val fecBlkPaddr = WireInit(0.U((PAddrBits - blockOffBits).W))
-  private val fecVSetIdx = WireInit(0.U(idxBits.W))
+  // Use registers to hold FEC detection results for one cycle
+  private val fecDetected = RegInit(false.B)
+  private val fecDetectedIdx = RegInit(0.U(log2Ceil(numEntries).W))
+  private val fecBlkPaddr = RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val fecVSetIdx = RegInit(0.U(idxBits.W))
+
+  // Wire to indicate if FEC is being detected this cycle
+  private val fecDetectThisCycle = WireInit(false.B)
+  private val fecDetectBlkPaddr = WireInit(0.U((PAddrBits - blockOffBits).W))
+  private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
+  private val fecDetectIdx = WireInit(0.U(log2Ceil(numEntries).W))
 
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
-    fecDetected := true.B
-    fecDetectedIdx := i.U
-    fecBlkPaddr := entry.blkPaddr
-    fecVSetIdx := entry.vSetIdx
+    fecDetectThisCycle := true.B
+    fecDetectIdx := i.U
+    fecDetectBlkPaddr := entry.blkPaddr
+    fecDetectVSetIdx := entry.vSetIdx
 
     entry.valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
@@ -125,22 +132,20 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val freeEntryIdx = PriorityEncoder(freeEntryVec)
 
   when(io.newMiss.valid) {
-    perfTotalMisses := perfTotalMisses + 1.U
-
     val hitVec = VecInit(
       entries.map(e => e.valid && (e.ftqIdx === io.newMiss.bits.ftqIdx))
     ) // Check if this miss is already being tracked
-    val hasHit = hitVec.asUInt.orR // Reduce to see if there's any hit
+    val hasHit = hitVec.asUInt.orR //Reduce to see if there's any hit
     val hitIdx = PriorityEncoder(hitVec)
 
     when(
       hasHit
-    ) { 
-      entries(hitIdx).blkPaddr := io.newMiss.bits.blkPaddr // Update block address if already tracking
+    ) {       perfTotalMisses := perfTotalMisses + 1.U // Count duplicate misses too      entries(hitIdx).blkPaddr := io.newMiss.bits.blkPaddr // Update block address if already tracking
       entries(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entries(hitIdx).allocTime := cycleCounter // Refresh allocation time on new miss for same FTQ entry
 
     }.elsewhen(hasFreeEntry) {
+      perfTotalMisses := perfTotalMisses + 1.U // Only count successfully allocated misses
       entries(freeEntryIdx).valid := true.B
       entries(freeEntryIdx).blkPaddr := io.newMiss.bits.blkPaddr
       entries(freeEntryIdx).vSetIdx := io.newMiss.bits.vSetIdx
@@ -195,6 +200,16 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
         }
       }
     }
+  }
+
+  // Update FEC detection registers
+  when(fecDetectThisCycle) {
+    fecDetected := true.B
+    fecDetectedIdx := fecDetectIdx
+    fecBlkPaddr := fecDetectBlkPaddr
+    fecVSetIdx := fecDetectVSetIdx
+  }.otherwise {
+    fecDetected := false.B
   }
 
   // Output FEC line signal

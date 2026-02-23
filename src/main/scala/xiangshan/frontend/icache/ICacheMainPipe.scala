@@ -179,6 +179,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
   private val s0_req_vaddr   = s0_req_vaddr_all.last
   private val s0_req_vSetIdx = s0_req_vSetIdx_all.last
   private val s0_doubleline  = s0_doubleline_all.last
+  //propagate ftqIdx for later FEC tracking
   private val s0_req_ftqIdx  = fromFtqReq(partWayNum).ftqIdx
 
   private val s0_backendException = fromFtq.bits.backendException
@@ -245,6 +246,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
   private val s1_req_gpaddr = RegEnable(s0_req_gpaddr, 0.U.asTypeOf(s0_req_gpaddr), s0_fire)
   private val s1_req_isForVSnonLeafPTE =
     RegEnable(s0_req_isForVSnonLeafPTE, 0.U.asTypeOf(s0_req_isForVSnonLeafPTE), s0_fire)
+  // propagate ftqIdx for later FEC tracking
   private val s1_req_ftqIdx       = RegEnable(s0_req_ftqIdx, 0.U.asTypeOf(s0_req_ftqIdx), s0_fire)
   private val s1_doubleline       = RegEnable(s0_doubleline, 0.U.asTypeOf(s0_doubleline), s0_fire)
   private val s1_SRAMhits         = RegEnable(s0_hits, 0.U.asTypeOf(s0_hits), s0_fire)
@@ -355,6 +357,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule with HasICache
   private val s2_req_gpaddr = RegEnable(s1_req_gpaddr, 0.U.asTypeOf(s1_req_gpaddr), s1_fire)
   private val s2_req_isForVSnonLeafPTE =
     RegEnable(s1_req_isForVSnonLeafPTE, 0.U.asTypeOf(s1_req_isForVSnonLeafPTE), s1_fire)
+  // propagate ftqIdx for later FEC tracking
   private val s2_req_ftqIdx       = RegEnable(s1_req_ftqIdx, 0.U.asTypeOf(s1_req_ftqIdx), s1_fire)
   private val s2_doubleline       = RegEnable(s1_doubleline, 0.U.asTypeOf(s1_doubleline), s1_fire)
   private val s2_exception        = RegEnable(s1_exception_out, 0.U.asTypeOf(s1_exception_out), s1_fire)
