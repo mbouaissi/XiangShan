@@ -938,6 +938,16 @@ class Ftq(implicit p: Parameters) extends XSModule with HasCircularQueuePtrHelpe
   io.toPrefetch.req.valid := toPrefetchEntryToSend && pfPtr =/= bpuPtr
   io.toPrefetch.req.bits.fromFtqPcBundle(toPrefetchPcBundle)
   io.toPrefetch.req.bits.ftqIdx  := pfPtr
+  io.toPrefetch.req.bits.pdipBtbMissTrigger :=
+    topdown_stage.reasons(TopDownCounters.BTBMissBubble.id)
+  io.toPrefetch.req.bits.pdipControlTrigger :=
+    io.toPrefetch.req.bits.pdipBtbMissTrigger ||
+      topdown_stage.reasons(TopDownCounters.TAGEMissBubble.id) ||
+      topdown_stage.reasons(TopDownCounters.SCMissBubble.id) ||
+      topdown_stage.reasons(TopDownCounters.ITTAGEMissBubble.id) ||
+      topdown_stage.reasons(TopDownCounters.RASMissBubble.id)
+  io.toPrefetch.req.bits.pdipHighCostHint :=
+    io.toPrefetch.req.bits.pdipControlTrigger
   io.toPrefetch.backendException := Mux(backendPcFaultPtr === pfPtr, backendException, ExceptionType.none)
   // io.toICache.req.bits.bypassSelect := last_cycle_bpu_in && bpu_in_bypass_ptr === ifuPtr
   // io.toICache.req.bits.bpuBypassWrite.zipWithIndex.map{case(bypassWrtie, i) =>

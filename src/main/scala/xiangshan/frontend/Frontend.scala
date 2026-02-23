@@ -193,6 +193,8 @@ class FrontendInlinedImp(outer: FrontendInlined) extends LazyModuleImp(outer)
   ifu.io.icacheInter.topdownItlbMiss   := icache.io.fetch.topdownItlbMiss
   icache.io.stop                       := ifu.io.icacheStop
   icache.io.flush                      := ftq.io.icacheFlush
+  // Forward ROB commits for FEC tracking
+  icache.io.rob_commits                := ifu.io.icacheInter.rob_commits
 
   ifu.io.icachePerfInfo := icache.io.perfInfo
 

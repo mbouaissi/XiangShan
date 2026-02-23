@@ -69,10 +69,16 @@ class FtqICacheInfo(implicit p: Parameters) extends XSBundle with HasICacheParam
   val startAddr      = UInt(VAddrBits.W)
   val nextlineStart  = UInt(VAddrBits.W)
   val ftqIdx         = new FtqPtr
+  val pdipHighCostHint = Bool()
+  val pdipControlTrigger = Bool()
+  val pdipBtbMissTrigger = Bool()
   def crossCacheline = startAddr(blockOffBits - 1) === 1.U
   def fromFtqPcBundle(b: Ftq_RF_Components) = {
     this.startAddr     := b.startAddr
     this.nextlineStart := b.nextLineAddr
+    this.pdipHighCostHint := false.B
+    this.pdipControlTrigger := false.B
+    this.pdipBtbMissTrigger := false.B
     this
   }
 }
@@ -82,6 +88,8 @@ class IFUICacheIO(implicit p: Parameters) extends XSBundle with HasICacheParamet
   val resp              = ValidIO(new ICacheMainPipeResp)
   val topdownIcacheMiss = Output(Bool())
   val topdownItlbMiss   = Output(Bool())
+  // FEC tracking: forward ROB commits for retirement tracking
+  val rob_commits       = Input(Vec(CommitWidth, Valid(new RobCommitInfo)))
 }
 
 class FtqToICacheRequestBundle(implicit p: Parameters) extends XSBundle with HasICacheParameters {
