@@ -78,6 +78,9 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
   *   1. Missed in the instruction cache
   *   2. Caused front-end stalls
   *   3. Had at least one instruction retire
+  * Cover the following scenarios:
+  *   - Missed -> Stall -> Retire (Normal order)
+  *   - Missed -> Retire -> Stall (late stall )    
   */
 class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     extends ICacheModule {
@@ -101,9 +104,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
   // Wire to indicate if FEC is being detected this cycle
   private val fecDetectThisCycle = WireInit(false.B)
+  private val fecDetectIdx = WireInit(0.U(log2Ceil(numEntries).W))
   private val fecDetectBlkPaddr = WireInit(0.U((PAddrBits - blockOffBits).W))
   private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
-  private val fecDetectIdx = WireInit(0.U(log2Ceil(numEntries).W))
 
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
     fecDetectThisCycle := true.B
@@ -119,33 +122,40 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val cycleCounter = RegInit(0.U(64.W))
   cycleCounter := cycleCounter + 1.U
 
-  // Performance counters
+  // Performance counters for debugging,
+  // TODO: REMOVE
   private val perfTotalMisses = RegInit(0.U(64.W))
   private val perfMissesWithStall = RegInit(0.U(64.W))
   private val perfFECLinesDetected = RegInit(0.U(64.W))
   private val perfTrackerFull = RegInit(0.U(64.W))
 
-  /** Entry Allocation - Track new cache misses
+  /** Has missed
     */
-  private val freeEntryVec = VecInit(entries.map(!_.valid))
+  private val freeEntryVec = VecInit(entries.map(entry => !entry.valid))
   private val hasFreeEntry = freeEntryVec.asUInt.orR
   private val freeEntryIdx = PriorityEncoder(freeEntryVec)
 
   when(io.newMiss.valid) {
+    perfTotalMisses := perfTotalMisses + 1.U // Count all miss events
+
     val hitVec = VecInit(
       entries.map(e => e.valid && (e.ftqIdx === io.newMiss.bits.ftqIdx))
     ) // Check if this miss is already being tracked
-    val hasHit = hitVec.asUInt.orR //Reduce to see if there's any hit
+    val hasHit = hitVec.asUInt.orR // Reduce to see if there's any hit
     val hitIdx = PriorityEncoder(hitVec)
 
     when(
       hasHit
-    ) {       perfTotalMisses := perfTotalMisses + 1.U // Count duplicate misses too      entries(hitIdx).blkPaddr := io.newMiss.bits.blkPaddr // Update block address if already tracking
+    ) {
+      entries(
+        hitIdx
+      ).blkPaddr := io.newMiss.bits.blkPaddr // Update block address if already tracking
       entries(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
-      entries(hitIdx).allocTime := cycleCounter // Refresh allocation time on new miss for same FTQ entry
+      entries(
+        hitIdx
+      ).allocTime := cycleCounter // Refresh allocation time on new miss for same FTQ entry
 
     }.elsewhen(hasFreeEntry) {
-      perfTotalMisses := perfTotalMisses + 1.U // Only count successfully allocated misses
       entries(freeEntryIdx).valid := true.B
       entries(freeEntryIdx).blkPaddr := io.newMiss.bits.blkPaddr
       entries(freeEntryIdx).vSetIdx := io.newMiss.bits.vSetIdx
@@ -159,7 +169,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     }
   }
 
-  /** Stall Status Update - Mark entries that caused stalls
+  /** Caused a stall
     */
   when(io.stallUpdate.valid) {
     entries.zipWithIndex.foreach { case (entry, i) =>
@@ -181,8 +191,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     }
   }
 
-  /** Retirement Update & FEC Detection When instructions from an FTQ entry
-    * retire, check if this completes the FEC condition (miss + stall + retired)
+  /** Was retired
     */
   // Process all retirement updates (up to CommitWidth per cycle)
   (0 until CommitWidth).foreach { w =>
@@ -218,7 +227,8 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.bits.vSetIdx := fecVSetIdx
 
   /** Entry Aging & Eviction Free entries that are too old (likely stale due to
-    * flush/redirect)
+    * flush/redirect) Use the aging mechanism to automatically clean up entries
+    * that might never get retired
     */
   private val agingThreshold = 1024.U // Cycles before considering entry stale
   entries.foreach { entry =>
