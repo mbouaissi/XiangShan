@@ -67,7 +67,9 @@ case class ICacheParameters(
     partWayNum:          Int = 4,
     nMMIOs:              Int = 1,
     blockBytes:          Int = 64,
-    cacheCtrlAddressOpt: Option[AddressSet] = None
+    cacheCtrlAddressOpt: Option[AddressSet] = None,
+    // PDIP parameters
+    pdipParams:          PDIPParams = PDIPParams()
 ) extends L1CacheParameters {
 
   val setBytes:     Int         = nSets * blockBytes
@@ -611,6 +613,14 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   private val prefetcher = Module(new IPrefetchPipe)
   private val wayLookup  = Module(new WayLookup)
   private val fecTracker = Module(new FECTracker(numEntries = 16))
+  private val pdipController = Module(new PDIPController(cacheParams.pdipParams))
+
+  println("  PDIP Enabled: " + cacheParams.pdipParams.enabled)
+  if (cacheParams.pdipParams.enabled) {
+    println("  PDIP Table Sets: " + cacheParams.pdipParams.numTableSets)
+    println("  PDIP Ways Per Set: " + cacheParams.pdipParams.numWaysPerSet)
+    println("  PDIP Prefetch Queue Size: " + cacheParams.pdipParams.prefetchQueueSize)
+  }
 
   private val ecc_enable = if (outer.ctrlUnitOpt.nonEmpty) outer.ctrlUnitOpt.get.module.io.ecc_enable else true.B
 
@@ -737,7 +747,50 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     fecTracker.io.retireUpdate(i).valid       := io.rob_commits(i).valid
     fecTracker.io.retireUpdate(i).bits.ftqIdx := io.rob_commits(i).bits.ftqIdx
   }
+  // Provide trigger address (currently fetching block address as approximation)
+  // In a more sophisticated design, this would be the mispredicted branch address
+  private val currentFetchBlkPaddr = Cat(
+    prefetcher.io.itlb(0).resp.bits.paddr(0)(PAddrBits - 1, blockOffBits),
+    0.U(blockOffBits.W)
+  )(PAddrBits - 1, blockOffBits)
+  fecTracker.io.triggerAddr := currentFetchBlkPaddr
   fecTracker.io.flush         := io.flush
+
+  // PDIP Controller connections
+  pdipController.io.enable := cacheParams.pdipParams.enabled.B && io.csr_pf_enable
+  pdipController.io.flush := io.flush
+  
+  // Trigger from ftq prefetch request (when valid)
+  pdipController.io.trigger.valid := io.ftqPrefetch.req.valid && cacheParams.pdipParams.enabled.B
+  pdipController.io.trigger.bits.blkPaddr := io.ftqPrefetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
+  
+  // Learn from FEC line detections
+  pdipController.io.fecLine <> fecTracker.io.fecLine
+  
+  // MSHR availability check (simplified - always allow for now)
+  // TODO: Implement proper MSHR resource tracking
+  pdipController.io.mshrAvailable := true.B
+  
+  // Connect PDIP prefetch requests to miss unit
+  // PDIP prefetches go through the prefetch MSHR path
+  when(pdipController.io.prefetchReq.valid && cacheParams.pdipParams.enabled.B) {
+    // Create a prefetch request from PDIP
+    val pdipPrefetchReq = Wire(new ICacheMissReq)
+    pdipPrefetchReq.blkPaddr := pdipController.io.prefetchReq.bits.blkPaddr
+    pdipPrefetchReq.vSetIdx := pdipController.io.prefetchReq.bits.vSetIdx
+    
+    // Priority: PDIP prefetches have lower priority than regular prefetches
+    // This is a simplified integration - in full design, multiplex properly
+    when(!prefetcher.io.MSHRReq.valid) {
+      missUnit.io.prefetch_req.valid := true.B
+      missUnit.io.prefetch_req.bits := pdipPrefetchReq
+      pdipController.io.prefetchReq.ready := missUnit.io.prefetch_req.ready
+    }.otherwise {
+      pdipController.io.prefetchReq.ready := false.B
+    }
+  }.otherwise {
+    pdipController.io.prefetchReq.ready := false.B
+  }
 
   // notify IFU that Icache pipeline is available
   io.toIFU    := mainPipe.io.fetch.req.ready

@@ -62,7 +62,11 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
   val fecLine = ValidIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
+    val triggerAddr = UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
   })
+
+  // Input: Trigger address (from redirect/misprediction)
+  val triggerAddr = Input(UInt((PAddrBits - blockOffBits).W))
 
   // Input: Global flush signal
   val flush = Input(Bool())
@@ -101,18 +105,21 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecDetectedIdx = RegInit(0.U(log2Ceil(numEntries).W))
   private val fecBlkPaddr = RegInit(0.U((PAddrBits - blockOffBits).W))
   private val fecVSetIdx = RegInit(0.U(idxBits.W))
+  private val fecTriggerAddr = RegInit(0.U((PAddrBits - blockOffBits).W))
 
   // Wire to indicate if FEC is being detected this cycle
   private val fecDetectThisCycle = WireInit(false.B)
   private val fecDetectIdx = WireInit(0.U(log2Ceil(numEntries).W))
   private val fecDetectBlkPaddr = WireInit(0.U((PAddrBits - blockOffBits).W))
   private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
+  private val fecDetectTriggerAddr = WireInit(0.U((PAddrBits - blockOffBits).W))
 
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
     fecDetectThisCycle := true.B
     fecDetectIdx := i.U
     fecDetectBlkPaddr := entry.blkPaddr
     fecDetectVSetIdx := entry.vSetIdx
+    fecDetectTriggerAddr := io.triggerAddr // Capture current trigger
 
     entry.valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
@@ -217,6 +224,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecDetectedIdx := fecDetectIdx
     fecBlkPaddr := fecDetectBlkPaddr
     fecVSetIdx := fecDetectVSetIdx
+    fecTriggerAddr := fecDetectTriggerAddr
   }.otherwise {
     fecDetected := false.B
   }
@@ -225,6 +233,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.valid := fecDetected
   io.fecLine.bits.blkPaddr := fecBlkPaddr
   io.fecLine.bits.vSetIdx := fecVSetIdx
+  io.fecLine.bits.triggerAddr := fecTriggerAddr
 
   /** Entry Aging & Eviction Free entries that are too old (likely stale due to
     * flush/redirect) Use the aging mechanism to automatically clean up entries
