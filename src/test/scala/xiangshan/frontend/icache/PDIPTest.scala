@@ -105,6 +105,46 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
   
+  it should "decay confidence when updating entries" in {
+    test(new PDIPTable(pdipParams)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
+      dut.clock.setTimeout(100)
+
+      dut.io.flush.poke(false.B)
+      dut.clock.step(1)
+
+      // allocate first target for trigger
+      dut.io.allocate.valid.poke(true.B)
+      dut.io.allocate.bits.trigger.poke(0x1000.U)
+      dut.io.allocate.bits.target.valid.poke(true.B)
+      dut.io.allocate.bits.target.blkPaddr.poke(0x2000.U)
+      dut.io.allocate.bits.target.vSetIdx.poke(0x10.U)
+      dut.io.allocate.bits.target.confidence.poke(2.U)
+      dut.clock.step(1)
+
+      // allocate a second, different target for the same trigger
+      dut.io.allocate.bits.target.blkPaddr.poke(0x3000.U)
+      dut.io.allocate.bits.target.vSetIdx.poke(0x20.U)
+      dut.clock.step(1)
+
+      // turn off allocation and perform a lookup
+      dut.io.allocate.valid.poke(false.B)
+      dut.io.lookup.req.valid.poke(true.B)
+      dut.io.lookup.req.bits.trigger.poke(0x1000.U)
+      dut.clock.step(1)
+
+      assert(dut.io.lookup.resp.valid.peek().litToBoolean,
+             "Lookup should hit after two allocations")
+
+      // first target should have decayed from 2 to 1, second retains 2
+      val c0 = dut.io.lookup.resp.bits(0).confidence.peek().litValue
+      val c1 = dut.io.lookup.resp.bits(1).confidence.peek().litValue
+      assert(c0 == 1, s"First target confidence should decay to 1 (got $c0)")
+      assert(c1 == 2, s"Second target initial confidence should be 2 (got $c1)")
+
+      println("[PDIP Table Test] Confidence decay on update verified")
+    }
+  }
+
   it should "handle flush correctly" in {
     test(new PDIPTable(pdipParams)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
       dut.clock.setTimeout(100)

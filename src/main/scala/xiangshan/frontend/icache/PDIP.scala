@@ -9,36 +9,41 @@ import xiangshan.frontend._
 /** PDIP (Prefetch-Directed Instruction Prefetching) Parameters
   */
 case class PDIPParams(
-  enabled: Boolean = true,
-  numTableSets: Int = 64,         // Number of sets in PDIP table
-  numWaysPerSet: Int = 4,         // Associativity of PDIP table
-  numTargetsPerEntry: Int = 4,    // Max FEC targets per trigger
-  prefetchQueueSize: Int = 8,     // Size of prefetch queue
-  mshrCheckEnabled: Boolean = true // Check MSHR availability before prefetch
+    enabled: Boolean = true,
+    numTableSets: Int = 64, // Number of sets in PDIP table
+    numWaysPerSet: Int = 4, // Associativity of PDIP table
+    numTargetsPerEntry: Int = 4, // Max FEC targets per trigger
+    prefetchQueueSize: Int = 8, // Size of prefetch queue
+    mshrCheckEnabled: Boolean = true // Check MSHR availability before prefetch
 )
 
-/** PDIP Trigger-Candidate Association
-  * Maps a trigger instruction block address to FEC cache line candidates
+/** PDIP Trigger-Candidate Association Maps a trigger instruction block address
+  * to FEC cache line candidates
   */
-class PDIPTableEntry(numTargets: Int)(implicit p: Parameters) extends ICacheBundle {
-  val valid: Bool = Bool()                                      // Entry is valid
-  val trigger: UInt = UInt((PAddrBits - blockOffBits).W)        // Trigger block address
-  val targets: Vec[PDIPTarget] = Vec(numTargets, new PDIPTarget) // FEC line targets
-  val lru: UInt = UInt(log2Ceil(numTargets).W)                  // LRU for target replacement
+class PDIPTableEntry(numTargets: Int)(implicit p: Parameters)
+    extends ICacheBundle {
+  val valid: Bool = Bool() // Entry is valid
+  val trigger: UInt = UInt(
+    (PAddrBits - blockOffBits).W
+  ) // Trigger block address
+  val targets: Vec[PDIPTarget] =
+    Vec(numTargets, new PDIPTarget) // FEC line targets
+  val lru: UInt = UInt(log2Ceil(numTargets).W) // LRU for target replacement
 }
 
 /** PDIP Prefetch Target (FEC Line)
   */
 class PDIPTarget(implicit p: Parameters) extends ICacheBundle {
-  val valid: Bool = Bool()                                // Target is valid
+  val valid: Bool = Bool() // Target is valid
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W) // FEC block address
-  val vSetIdx: UInt = UInt(idxBits.W)                     // Virtual set index
-  val confidence: UInt = UInt(2.W)                        // 2-bit confidence counter
+  val vSetIdx: UInt = UInt(idxBits.W) // Virtual set index
+  val confidence: UInt = UInt(2.W) // 2-bit confidence counter
 }
 
 /** PDIP Table IO
   */
-class PDIPTableIO(params: PDIPParams)(implicit p: Parameters) extends ICacheBundle {
+class PDIPTableIO(params: PDIPParams)(implicit p: Parameters)
+    extends ICacheBundle {
   // Lookup by trigger address
   val lookup = new Bundle {
     val req = Flipped(ValidIO(new Bundle {
@@ -46,125 +51,171 @@ class PDIPTableIO(params: PDIPParams)(implicit p: Parameters) extends ICacheBund
     }))
     val resp = ValidIO(Vec(params.numTargetsPerEntry, new PDIPTarget))
   }
-  
+
   // Allocate new trigger-target association
   val allocate = Flipped(ValidIO(new Bundle {
     val trigger = UInt((PAddrBits - blockOffBits).W)
     val target = new PDIPTarget
   }))
-  
+
   // Flush signal
   val flush = Input(Bool())
 }
 
-/** PDIP Table
-  * Set-associative structure to store trigger -> FEC target associations
+/** PDIP Table Set-associative structure to store trigger -> FEC target
+  * associations
   */
-class PDIPTable(params: PDIPParams)(implicit p: Parameters) extends ICacheModule {
+class PDIPTable(params: PDIPParams)(implicit p: Parameters)
+    extends ICacheModule {
   val io: PDIPTableIO = IO(new PDIPTableIO(params))
-  
+
   // Storage: 2D array [sets][ways]
-  private val table = RegInit(VecInit(Seq.fill(params.numTableSets)(
-    VecInit(Seq.fill(params.numWaysPerSet)(
-      0.U.asTypeOf(new PDIPTableEntry(params.numTargetsPerEntry))
-    ))
-  )))
-  
+  private val table = RegInit(
+    VecInit(
+      Seq.fill(params.numTableSets)(
+        VecInit(
+          Seq.fill(params.numWaysPerSet)(
+            0.U.asTypeOf(new PDIPTableEntry(params.numTargetsPerEntry))
+          )
+        )
+      )
+    )
+  )
+
   // Compute set index from trigger address
   private def getSetIdx(trigger: UInt): UInt = {
     trigger(log2Ceil(params.numTableSets) - 1, 0)
   }
-  
+
   // Lookup logic (combinational)
-  private val lookupSetIdx = getSetIdx(io.lookup.req.bits.trigger)
-  private val lookupSet = table(lookupSetIdx)
-  
+  private val lookupSet = table(getSetIdx(io.lookup.req.bits.trigger))
+
   // Find matching way
-  private val matchWay = VecInit(lookupSet.map(entry => 
-    entry.valid && entry.trigger === io.lookup.req.bits.trigger
-  )).asUInt
-  
+  private val matchWay = VecInit(
+    lookupSet.map(entry =>
+      entry.valid && entry.trigger === io.lookup.req.bits.trigger
+    )
+  ).asUInt
+
   private val hitWay = OHToUInt(matchWay)
-  private val hit = matchWay.orR
-  
+  private val hit = matchWay =/= 0.U
+
   // Output targets if hit
   io.lookup.resp.valid := io.lookup.req.valid && hit
-  io.lookup.resp.bits := Mux(hit, lookupSet(hitWay).targets, 
-    VecInit(Seq.fill(params.numTargetsPerEntry)(0.U.asTypeOf(new PDIPTarget))))
-  
+  // If stored, return stored target, otherwise, return 0s
+  io.lookup.resp.bits := Mux(
+    hit,
+    lookupSet(hitWay).targets,
+    VecInit(Seq.fill(params.numTargetsPerEntry)(0.U.asTypeOf(new PDIPTarget)))
+  )
+
   // Allocation logic
   when(io.allocate.valid && !io.flush) {
     val allocSetIdx = getSetIdx(io.allocate.bits.trigger)
     val allocSet = table(allocSetIdx)
-    
+
     // Check if trigger already exists
-    val existingWayOH = VecInit(allocSet.map(entry =>
-      entry.valid && entry.trigger === io.allocate.bits.trigger
-    )).asUInt
-    
+    val existingWayOH = VecInit(
+      allocSet.map(entry =>
+        entry.valid && entry.trigger === io.allocate.bits.trigger
+      )
+    ).asUInt
+
     val existingWay = OHToUInt(existingWayOH)
-    val triggerExists = existingWayOH.orR
-    
+    val triggerExists = existingWayOH =/= 0.U
+
     when(triggerExists) {
       // Update existing entry: add target
       val entry = allocSet(existingWay)
       val targetSlot = entry.targets
-      
+
       // Find invalid slot or replace LRU
       val invalidSlot = VecInit(targetSlot.map(!_.valid)).asUInt
       val hasInvalidSlot = invalidSlot.orR
-      val replaceIdx = Mux(hasInvalidSlot, PriorityEncoder(invalidSlot), entry.lru)
-      
+      val replaceIdx =
+        Mux(hasInvalidSlot, PriorityEncoder(invalidSlot), entry.lru)
+
       // Check if target already exists (avoid duplicates)
-      val targetExists = VecInit(targetSlot.map(t => 
-        t.valid && t.blkPaddr === io.allocate.bits.target.blkPaddr
-      )).asUInt.orR
-      
+      val targetExists = VecInit(
+        targetSlot.map(t =>
+          t.valid && t.blkPaddr === io.allocate.bits.target.blkPaddr
+        )
+      ).asUInt.orR
+
       when(!targetExists) {
         targetSlot(replaceIdx) := io.allocate.bits.target
         targetSlot(replaceIdx).valid := true.B
         // Update confidence for new target
         targetSlot(replaceIdx).confidence := 2.U // Initial confidence
-        
+
+        // Decay the confidence of the other slots in the same entry
+        // (simple aging mechanism so values are not strictly monotonic)
+        for (i <- 0 until params.numTargetsPerEntry) {
+          when(i.U =/= replaceIdx && targetSlot(i).confidence =/= 0.U) {
+            targetSlot(i).confidence := targetSlot(i).confidence - 1.U
+          }
+        }
+
         // Update LRU
-        entry.lru := Mux(replaceIdx === (params.numTargetsPerEntry - 1).U, 
-          0.U, replaceIdx + 1.U)
+        entry.lru := Mux(
+          replaceIdx === (params.numTargetsPerEntry - 1).U,
+          0.U,
+          replaceIdx + 1.U
+        )
       }.otherwise {
         // Target exists, boost confidence
-        val existingTargetIdx = PriorityEncoder(VecInit(targetSlot.map(t =>
-          t.valid && t.blkPaddr === io.allocate.bits.target.blkPaddr
-        )))
+        val existingTargetIdx = PriorityEncoder(
+          VecInit(
+            targetSlot.map(t =>
+              t.valid && t.blkPaddr === io.allocate.bits.target.blkPaddr
+            )
+          )
+        )
         when(targetSlot(existingTargetIdx).confidence < 3.U) {
-          targetSlot(existingTargetIdx).confidence := targetSlot(existingTargetIdx).confidence + 1.U
+          targetSlot(existingTargetIdx).confidence := targetSlot(
+            existingTargetIdx
+          ).confidence + 1.U
+        }
+        // Decay other targets in the same entry on an update/hit as well
+        for (i <- 0 until params.numTargetsPerEntry) {
+          when(i.U =/= existingTargetIdx && targetSlot(i).confidence =/= 0.U) {
+            targetSlot(i).confidence := targetSlot(i).confidence - 1.U
+          }
         }
       }
     }.otherwise {
       // Allocate new entry or replace invalid/LRU way
       val invalidWay = VecInit(allocSet.map(!_.valid)).asUInt
       val hasInvalidWay = invalidWay.orR
-      
+
       // Simple FIFO replacement for ways (can be enhanced with true LRU)
-      val replaceWayIdx = RegNext(RegNext(allocSetIdx(log2Ceil(params.numWaysPerSet) - 1, 0)))
-      val replaceWayOH = Mux(hasInvalidWay, invalidWay, 
-        UIntToOH(replaceWayIdx, params.numWaysPerSet)) // FIFO-ish
+      val replaceWayIdx =
+        RegNext(RegNext(allocSetIdx(log2Ceil(params.numWaysPerSet) - 1, 0)))
+      val replaceWayOH = Mux(
+        hasInvalidWay,
+        invalidWay,
+        UIntToOH(replaceWayIdx, params.numWaysPerSet)
+      ) // FIFO-ish
       val replaceWay = OHToUInt(replaceWayOH)
-      
+
       // Initialize new entry
       val newEntry = Wire(new PDIPTableEntry(params.numTargetsPerEntry))
       newEntry.valid := true.B
       newEntry.trigger := io.allocate.bits.trigger
-      newEntry.targets := VecInit(Seq.fill(params.numTargetsPerEntry)(
-        0.U.asTypeOf(new PDIPTarget)
-      ))
+      newEntry.targets := VecInit(
+        Seq.fill(params.numTargetsPerEntry)(
+          0.U.asTypeOf(new PDIPTarget)
+        )
+      )
       newEntry.targets(0) := io.allocate.bits.target
       newEntry.targets(0).valid := true.B
       newEntry.targets(0).confidence := 2.U // Initial confidence
       newEntry.lru := 1.U // Next target goes to slot 1
-      
+
       table(allocSetIdx)(replaceWay) := newEntry
     }
   }
-  
+
   // Flush: invalidate all entries
   when(io.flush) {
     table.foreach(set => set.foreach(entry => entry.valid := false.B))
@@ -182,55 +233,60 @@ class PrefetchQueueEntry(implicit p: Parameters) extends ICacheBundle {
 
 /** Prefetch Queue IO
   */
-class PrefetchQueueIO(queueSize: Int)(implicit p: Parameters) extends ICacheBundle {
+class PrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
+    extends ICacheBundle {
   // Enqueue prefetch request
   val enq = Flipped(DecoupledIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
     val vaddr = UInt(VAddrBits.W)
   }))
-  
+
   // Dequeue to issue prefetch
   val deq = DecoupledIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
     val vaddr = UInt(VAddrBits.W)
   })
-  
+
   // MSHR resource check (input from ICache)
   val mshrAvailable = Input(Bool())
-  
+
   // Flush signal
   val flush = Input(Bool())
-  
+
   // Status
   val empty = Output(Bool())
   val full = Output(Bool())
 }
 
-/** Prefetch Queue
-  * Decouples PDIP prefetch requests from ICache MSHR allocation
+/** Prefetch Queue Decouples PDIP prefetch requests from ICache MSHR allocation
   */
-class PrefetchQueue(queueSize: Int)(implicit p: Parameters) extends ICacheModule {
+class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
+    extends ICacheModule {
   val io: PrefetchQueueIO = IO(new PrefetchQueueIO(queueSize))
-  
+
   // Queue storage
-  private val queue = RegInit(VecInit(Seq.fill(queueSize)(
-    0.U.asTypeOf(new PrefetchQueueEntry)
-  )))
-  
+  private val queue = RegInit(
+    VecInit(
+      Seq.fill(queueSize)(
+        0.U.asTypeOf(new PrefetchQueueEntry)
+      )
+    )
+  )
+
   // Head and tail pointers
   private val head = RegInit(0.U(log2Ceil(queueSize).W))
   private val tail = RegInit(0.U(log2Ceil(queueSize).W))
   private val maybe_full = RegInit(false.B)
-  
+
   private val ptr_match = head === tail
   private val empty = ptr_match && !maybe_full
   private val full = ptr_match && maybe_full
-  
+
   io.empty := empty
   io.full := full
-  
+
   // Enqueue logic
   io.enq.ready := !full
   when(io.enq.fire && !io.flush) {
@@ -238,34 +294,34 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters) extends ICacheModule
     queue(tail).blkPaddr := io.enq.bits.blkPaddr
     queue(tail).vSetIdx := io.enq.bits.vSetIdx
     queue(tail).vaddr := io.enq.bits.vaddr
-    
+
     tail := tail + 1.U
     when(tail === (queueSize - 1).U) {
       tail := 0.U
     }
-    
+
     when(ptr_match) {
       maybe_full := true.B
     }
   }
-  
+
   // Dequeue logic: only issue when MSHR available
   io.deq.valid := !empty && queue(head).valid && io.mshrAvailable
   io.deq.bits.blkPaddr := queue(head).blkPaddr
   io.deq.bits.vSetIdx := queue(head).vSetIdx
   io.deq.bits.vaddr := queue(head).vaddr
-  
+
   when(io.deq.fire && !io.flush) {
     queue(head).valid := false.B
-    
+
     head := head + 1.U
     when(head === (queueSize - 1).U) {
       head := 0.U
     }
-    
+
     maybe_full := false.B
   }
-  
+
   // Flush: clear all entries
   when(io.flush) {
     queue.foreach(_.valid := false.B)
@@ -277,35 +333,33 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters) extends ICacheModule
 
 /** PDIP Controller IO
   */
-class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters) extends ICacheBundle {
+class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
+    extends ICacheBundle {
   // Input: Current instruction block address from BPU/IFU
   val trigger = Flipped(ValidIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
   }))
-  
+
   // Input: FEC line detected (from FECTracker)
   val fecLine = Flipped(ValidIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
-    val triggerAddr = UInt((PAddrBits - blockOffBits).W) // Trigger that caused this FEC
+    val triggerAddr =
+      UInt((PAddrBits - blockOffBits).W) // Trigger that caused this FEC
   }))
-  
+
   // Output: Prefetch request to ICache
-  val prefetchReq = DecoupledIO(new Bundle {
-    val blkPaddr = UInt((PAddrBits - blockOffBits).W)
-    val vSetIdx = UInt(idxBits.W)
-    val vaddr = UInt(VAddrBits.W)
-  })
-  
+  val prefetchReq: DecoupledIO[ICacheMissReq] = DecoupledIO(new ICacheMissReq)
+
   // MSHR availability check
   val mshrAvailable = Input(Bool())
-  
+
   // Flush signal
   val flush = Input(Bool())
-  
+
   // Enable/disable PDIP
   val enable = Input(Bool())
-  
+
   // Performance counters
   val perfInfo = Output(new Bundle {
     val totalPrefetches = UInt(64.W)
@@ -315,91 +369,91 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters) extends ICach
   })
 }
 
-/** PDIP Controller
-  * Main control logic for PDIP prefetching
+/** PDIP Controller Main control logic for PDIP prefetching
   */
-class PDIPController(params: PDIPParams)(implicit p: Parameters) extends ICacheModule {
+class PDIPController(params: PDIPParams)(implicit p: Parameters)
+    extends ICacheModule {
   val io: PDIPControllerIO = IO(new PDIPControllerIO(params))
-  
+
   // Instantiate PDIP table
   private val pdipTable = Module(new PDIPTable(params))
-  
+
   // Instantiate Prefetch Queue
-  private val prefetchQueue = Module(new PrefetchQueue(params.prefetchQueueSize))
-  
+  private val prefetchQueue = Module(
+    new PrefetchQueue(params.prefetchQueueSize)
+  )
+
+  // Global gating
+  private val active = io.enable && !io.flush
+
   // Connect flush signals
   pdipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
-  
+
   // Connect MSHR availability
   prefetchQueue.io.mshrAvailable := io.mshrAvailable
-  
+
   // Table lookup on trigger
-  pdipTable.io.lookup.req.valid := io.trigger.valid && io.enable
+  pdipTable.io.lookup.req.valid := io.trigger.valid && active
   pdipTable.io.lookup.req.bits.trigger := io.trigger.bits.blkPaddr
-  
+
   // When table hit, enqueue valid targets to prefetch queue
-  private val targetsValid = pdipTable.io.lookup.resp.valid
-  private val targets = pdipTable.io.lookup.resp.bits
-  
-  // Enqueue targets with sufficient confidence (confidence >= 2)
-  private val validTargets = VecInit(targets.map(t => 
-    t.valid && t.confidence >= 2.U
-  ))
-  
-  // Use round-robin or priority encoder to select target to enqueue
-  private val targetSel = PriorityEncoder(validTargets.asUInt)
-  private val hasValidTarget = validTargets.asUInt.orR
-  
+  private val validTargetsOH = VecInit(
+    targets.map(t => t.valid && (t.confidence >= 2.U))
+  ).asUInt
+  private val hasValidTarget = validTargetsOH.orR
+  private val targetSel = PriorityEncoder(validTargetsOH)
+
   // Reconstruct virtual address (approximate - use vSetIdx and blkPaddr)
   // Note: This is a simplified reconstruction. In practice, might need TLB lookup
   private def reconstructVAddr(blkPaddr: UInt, vSetIdx: UInt): UInt = {
-    Cat(blkPaddr(PAddrBits - blockOffBits - 1, idxBits), 
-        vSetIdx, 
-        0.U(blockOffBits.W))
+    Cat(
+      blkPaddr(PAddrBits - blockOffBits - 1, idxBits),
+      vSetIdx,
+      0.U(blockOffBits.W)
+    )
   }
-  
-  prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && io.enable
+
+  prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && active
   prefetchQueue.io.enq.bits.blkPaddr := targets(targetSel).blkPaddr
   prefetchQueue.io.enq.bits.vSetIdx := targets(targetSel).vSetIdx
   prefetchQueue.io.enq.bits.vaddr := reconstructVAddr(
-    targets(targetSel).blkPaddr, 
+    targets(targetSel).blkPaddr,
     targets(targetSel).vSetIdx
   )
-  
+
   // Learn from FEC line detections: allocate trigger-target associations
-  pdipTable.io.allocate.valid := io.fecLine.valid && io.enable
+  pdipTable.io.allocate.valid := io.fecLine.valid && active
   pdipTable.io.allocate.bits.trigger := io.fecLine.bits.triggerAddr
   pdipTable.io.allocate.bits.target.valid := true.B
   pdipTable.io.allocate.bits.target.blkPaddr := io.fecLine.bits.blkPaddr
   pdipTable.io.allocate.bits.target.vSetIdx := io.fecLine.bits.vSetIdx
   pdipTable.io.allocate.bits.target.confidence := 2.U // Initial confidence
-  
+
   // Connect prefetch queue output to controller output
   io.prefetchReq <> prefetchQueue.io.deq
-  
+
   // Performance counters
   private val perfTotalPrefetches = RegInit(0.U(64.W))
   private val perfTableLookups = RegInit(0.U(64.W))
   private val perfTableHits = RegInit(0.U(64.W))
   private val perfQueueFull = RegInit(0.U(64.W))
-  
+
   when(io.prefetchReq.fire) {
     perfTotalPrefetches := perfTotalPrefetches + 1.U
   }
-  
-  when(pdipTable.io.lookup.req.fire) {
+  when(pdipTable.io.lookup.req.valid) {
     perfTableLookups := perfTableLookups + 1.U
   }
-  
+
   when(pdipTable.io.lookup.resp.valid) {
     perfTableHits := perfTableHits + 1.U
   }
-  
+
   when(prefetchQueue.io.enq.valid && !prefetchQueue.io.enq.ready) {
     perfQueueFull := perfQueueFull + 1.U
   }
-  
+
   io.perfInfo.totalPrefetches := perfTotalPrefetches
   io.perfInfo.tableLookups := perfTableLookups
   io.perfInfo.tableHits := perfTableHits
