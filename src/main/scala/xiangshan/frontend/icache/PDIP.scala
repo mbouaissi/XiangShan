@@ -37,6 +37,7 @@ class PDIPTarget(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool() // Target is valid
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W) // FEC block address
   val vSetIdx: UInt = UInt(idxBits.W) // Virtual set index
+  val blkVaddr: UInt = UInt((VAddrBits - blockOffBits).W)
   val confidence: UInt = UInt(2.W) // 2-bit confidence counter
 }
 
@@ -189,14 +190,16 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
       val hasInvalidWay = invalidWay.orR
 
       // Simple FIFO replacement for ways (can be enhanced with true LRU)
-      val replaceWayIdx =
-        RegNext(RegNext(allocSetIdx(log2Ceil(params.numWaysPerSet) - 1, 0)))
+      val rrWay = RegInit(0.U(log2Ceil(params.numWaysPerSet).W))
       val replaceWayOH = Mux(
         hasInvalidWay,
         invalidWay,
-        UIntToOH(replaceWayIdx, params.numWaysPerSet)
-      ) // FIFO-ish
+        UIntToOH(rrWay, params.numWaysPerSet)
+      )
       val replaceWay = OHToUInt(replaceWayOH)
+      when(!hasInvalidWay) {
+        rrWay := Mux(rrWay === (params.numWaysPerSet - 1).U, 0.U, rrWay + 1.U)
+      }
 
       // Initialize new entry
       val newEntry = Wire(new PDIPTableEntry(params.numTargetsPerEntry))
@@ -226,20 +229,17 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
   */
 class PrefetchQueueEntry(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool()
-  val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W)
-  val vSetIdx: UInt = UInt(idxBits.W)
+  val vaddr: UInt = UInt(VAddrBits.W)
 }
 
 /** Prefetch Queue IO
   */
 class PrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
     extends ICacheBundle {
-  val enq = Flipped(DecoupledIO(new ICacheMissReq))
-  val deq = DecoupledIO(new ICacheMissReq)
+  val enq = Flipped(DecoupledIO(UInt(VAddrBits.W)))
+  val deq = DecoupledIO(UInt(VAddrBits.W))
 
   val flush = Input(Bool())
-
-  // notify when an MSHR is free so we only dequeue when we can allocate
   val mshrAvailable = Input(Bool())
 
   val empty = Output(Bool())
@@ -252,16 +252,10 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
     extends ICacheModule {
   val io: PrefetchQueueIO = IO(new PrefetchQueueIO(queueSize))
 
-  // Queue storage
   private val queue = RegInit(
-    VecInit(
-      Seq.fill(queueSize)(
-        0.U.asTypeOf(new PrefetchQueueEntry)
-      )
-    )
+    VecInit(Seq.fill(queueSize)(0.U.asTypeOf(new PrefetchQueueEntry)))
   )
 
-  // Head and tail pointers
   private val head = RegInit(0.U(log2Ceil(queueSize).W))
   private val tail = RegInit(0.U(log2Ceil(queueSize).W))
   private val maybe_full = RegInit(false.B)
@@ -273,40 +267,32 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
   io.empty := empty
   io.full := full
 
-  // Enqueue logic
+  // Enqueue
   io.enq.ready := !full
   when(io.enq.fire && !io.flush) {
     queue(tail).valid := true.B
-    queue(tail).blkPaddr := io.enq.bits.blkPaddr
-    queue(tail).vSetIdx := io.enq.bits.vSetIdx
+    queue(tail).vaddr := io.enq.bits
 
-    tail := tail + 1.U
-    when(tail === (queueSize - 1).U) {
-      tail := 0.U
-    }
+    val tailNext = Mux(tail === (queueSize - 1).U, 0.U, tail + 1.U)
+    tail := tailNext
 
-    when(ptr_match) {
-      maybe_full := true.B
-    }
+    when(ptr_match) { maybe_full := true.B }
   }
 
-  // Dequeue logic: only issue when MSHR available
+  // Dequeue (only when MSHR available)
   io.deq.valid := !empty && queue(head).valid && io.mshrAvailable
-  io.deq.bits.blkPaddr := queue(head).blkPaddr
-  io.deq.bits.vSetIdx := queue(head).vSetIdx
+  io.deq.bits := queue(head).vaddr
 
   when(io.deq.fire && !io.flush) {
     queue(head).valid := false.B
 
-    head := head + 1.U
-    when(head === (queueSize - 1).U) {
-      head := 0.U
-    }
+    val headNext = Mux(head === (queueSize - 1).U, 0.U, head + 1.U)
+    head := headNext
 
     maybe_full := false.B
   }
 
-  // Flush: clear all entries
+  // Flush
   when(io.flush) {
     queue.foreach(_.valid := false.B)
     head := 0.U
@@ -327,14 +313,14 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
   // Input: FEC line detected (from FECTracker)
   val fecLine = Flipped(ValidIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
+    val blkVaddr = UInt((VAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
     val triggerAddr =
       UInt((PAddrBits - blockOffBits).W) // Trigger that caused this FEC
   }))
 
   // Output: Prefetch request to ICache
-  val prefetchReq: DecoupledIO[ICacheMissReq] = DecoupledIO(new ICacheMissReq)
-
+  val prefetchVaddr: DecoupledIO[UInt] = DecoupledIO(UInt(VAddrBits.W))
   // MSHR availability check
   val mshrAvailable = Input(Bool())
 
@@ -359,63 +345,70 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
     extends ICacheModule {
   val io: PDIPControllerIO = IO(new PDIPControllerIO(params))
 
-  // Instantiate PDIP table
   private val pdipTable = Module(new PDIPTable(params))
-
-  // Instantiate Prefetch Queue
   private val prefetchQueue = Module(
     new PrefetchQueue(params.prefetchQueueSize)
   )
 
-  // Global gating
   private val active = io.enable && !io.flush
 
-  // Connect flush signals
   pdipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
-
-  // Connect MSHR availability
   prefetchQueue.io.mshrAvailable := io.mshrAvailable
 
   // Table lookup on trigger
   pdipTable.io.lookup.req.valid := io.trigger.valid && active
   pdipTable.io.lookup.req.bits.trigger := io.trigger.bits.blkPaddr
 
-  // make response fields easier to reference
   private val targetsValid = pdipTable.io.lookup.resp.valid
   private val targets = pdipTable.io.lookup.resp.bits
 
-  // When table hit, enqueue valid targets to prefetch queue
   private val validTargetsOH = VecInit(
     targets.map(t => t.valid && (t.confidence >= 2.U))
   ).asUInt
   private val hasValidTarget = validTargetsOH.orR
   private val targetSel = PriorityEncoder(validTargetsOH)
 
-  // Reconstruct virtual address (approximate - use vSetIdx and blkPaddr)
-  // Note: This is a simplified reconstruction. In practice, might need TLB lookup
+  // Enqueue one chosen target each cycle (simple)
+  prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && active
+  val vaddr = Cat(targets(targetSel).blkVaddr, 0.U(blockOffBits.W))
+  prefetchQueue.io.enq.bits := vaddr
+
+  // Learn from FEC line detections: allocate trigger-target associations
+  // Since fecLine doesn't carry blkVaddr, reconstruct a best-effort blkVaddr from (blkPaddr, vSetIdx).
   private def reconstructVAddr(blkPaddr: UInt, vSetIdx: UInt): UInt = {
-    Cat(
-      blkPaddr(PAddrBits - blockOffBits - 1, idxBits),
+    val blkHi = blkPaddr.getWidth - 1
+    val upper = blkPaddr(blkHi, idxBits) // <-- never out-of-range
+
+    val raw = Cat(
+      upper,
       vSetIdx,
       0.U(blockOffBits.W)
     )
+
+    // Make sure we always return exactly VAddrBits bits (pad or truncate)
+    if (raw.getWidth >= VAddrBits) {
+      raw(VAddrBits - 1, 0)
+    } else {
+      Cat(0.U((VAddrBits - raw.getWidth).W), raw)
+    }
   }
 
-  prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && active
-  prefetchQueue.io.enq.bits.blkPaddr := targets(targetSel).blkPaddr
-  prefetchQueue.io.enq.bits.vSetIdx := targets(targetSel).vSetIdx
+  private val learnedBlkVaddr = reconstructVAddr(
+    io.fecLine.bits.blkPaddr,
+    io.fecLine.bits.vSetIdx
+  )(VAddrBits - 1, blockOffBits)
 
-  // Learn from FEC line detections: allocate trigger-target associations
   pdipTable.io.allocate.valid := io.fecLine.valid && active
   pdipTable.io.allocate.bits.trigger := io.fecLine.bits.triggerAddr
   pdipTable.io.allocate.bits.target.valid := true.B
   pdipTable.io.allocate.bits.target.blkPaddr := io.fecLine.bits.blkPaddr
   pdipTable.io.allocate.bits.target.vSetIdx := io.fecLine.bits.vSetIdx
-  pdipTable.io.allocate.bits.target.confidence := 2.U // Initial confidence
+  pdipTable.io.allocate.bits.target.confidence := 2.U
+  pdipTable.io.allocate.bits.target.blkVaddr := learnedBlkVaddr
 
-  // Connect prefetch queue output to controller output
-  io.prefetchReq <> prefetchQueue.io.deq
+  // Output
+  io.prefetchVaddr <> prefetchQueue.io.deq
 
   // Performance counters
   private val perfTotalPrefetches = RegInit(0.U(64.W))
@@ -423,17 +416,15 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   private val perfTableHits = RegInit(0.U(64.W))
   private val perfQueueFull = RegInit(0.U(64.W))
 
-  when(io.prefetchReq.fire) {
+  when(io.prefetchVaddr.fire) {
     perfTotalPrefetches := perfTotalPrefetches + 1.U
   }
   when(pdipTable.io.lookup.req.valid) {
     perfTableLookups := perfTableLookups + 1.U
   }
-
   when(pdipTable.io.lookup.resp.valid) {
     perfTableHits := perfTableHits + 1.U
   }
-
   when(prefetchQueue.io.enq.valid && !prefetchQueue.io.enq.ready) {
     perfQueueFull := perfQueueFull + 1.U
   }

@@ -9,6 +9,7 @@ import xiangshan.frontend._
 /** FEC Miss Information - signals a new cache miss to track */
 class FECMissInfo(implicit p: Parameters) extends ICacheBundle {
   val blkPaddr = UInt((PAddrBits - blockOffBits).W)
+  val blkVaddr = UInt((VAddrBits - blockOffBits).W)
   val vSetIdx = UInt(idxBits.W)
   val ftqIdx = new FtqPtr
 }
@@ -30,6 +31,7 @@ class FECRetireInfo(implicit p: Parameters) extends ICacheBundle {
 class FECCandidateEntry(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool() // entry allocated
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W) // block address
+  val blkVaddr: UInt = UInt((VAddrBits - blockOffBits).W)
   val vSetIdx: UInt = UInt(idxBits.W) // L1I set index
   val ftqIdx: FtqPtr = new FtqPtr // Associated FTQ entry index
   val allocTime: UInt = UInt(64.W) // Cycle when allocated, for aging
@@ -61,8 +63,10 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
   // Output: Confirmed FEC line (miss + stall + retired)
   val fecLine = ValidIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
+    val blkVaddr = UInt((VAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
-    val triggerAddr = UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
+    val triggerAddr =
+      UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
   })
 
   // Input: Trigger address (from redirect/misprediction)
@@ -84,7 +88,7 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
   *   3. Had at least one instruction retire
   * Cover the following scenarios:
   *   - Missed -> Stall -> Retire (Normal order)
-  *   - Missed -> Retire -> Stall (late stall )    
+  *   - Missed -> Retire -> Stall (late stall )
   */
 class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     extends ICacheModule {
@@ -114,6 +118,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
   private val fecDetectTriggerAddr = WireInit(0.U((PAddrBits - blockOffBits).W))
 
+  private val fecBlkVaddr = RegInit(0.U((VAddrBits - blockOffBits).W))
+  private val fecDetectBlkVaddr = WireInit(0.U((VAddrBits - blockOffBits).W))
+
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
     fecDetectThisCycle := true.B
     fecDetectIdx := i.U
@@ -123,6 +130,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
     entry.valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
+    fecDetectBlkVaddr := entry.blkVaddr
   }
 
   // Cycle counter for aging
@@ -157,6 +165,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       entries(
         hitIdx
       ).blkPaddr := io.newMiss.bits.blkPaddr // Update block address if already tracking
+      entries(hitIdx).blkVaddr := io.newMiss.bits.blkVaddr
       entries(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entries(
         hitIdx
@@ -165,6 +174,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     }.elsewhen(hasFreeEntry) {
       entries(freeEntryIdx).valid := true.B
       entries(freeEntryIdx).blkPaddr := io.newMiss.bits.blkPaddr
+      entries(freeEntryIdx).blkVaddr := io.newMiss.bits.blkVaddr
       entries(freeEntryIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entries(freeEntryIdx).ftqIdx := io.newMiss.bits.ftqIdx
       entries(freeEntryIdx).allocTime := cycleCounter
@@ -225,6 +235,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecBlkPaddr := fecDetectBlkPaddr
     fecVSetIdx := fecDetectVSetIdx
     fecTriggerAddr := fecDetectTriggerAddr
+    fecBlkVaddr := fecDetectBlkVaddr
   }.otherwise {
     fecDetected := false.B
   }
@@ -234,6 +245,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.bits.blkPaddr := fecBlkPaddr
   io.fecLine.bits.vSetIdx := fecVSetIdx
   io.fecLine.bits.triggerAddr := fecTriggerAddr
+  io.fecLine.bits.blkVaddr := fecBlkVaddr
 
   /** Entry Aging & Eviction Free entries that are too old (likely stale due to
     * flush/redirect) Use the aging mechanism to automatically clean up entries

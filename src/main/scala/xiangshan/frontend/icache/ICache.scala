@@ -45,6 +45,8 @@ import xiangshan._
 import xiangshan.cache._
 import xiangshan.cache.mmu.TlbRequestIO
 import xiangshan.frontend._
+import xiangshan.backend.fu.PMPReqBundle
+import xiangshan.cache.mmu.TlbReq
 
 case class ICacheParameters(
     nSets: Int = 256,
@@ -743,7 +745,8 @@ class ICacheImp(outer: ICache)
   private val pdipController = Module(
     new PDIPController(cacheParams.pdipParams)
   )
-
+  // PDIPPrefetchPipe translates PDIP controller virtual addresses to miss requests
+  private val pdipPrefetchPipe = Module(new PDIPPrefetchPipe)
   println("  PDIP Enabled: " + cacheParams.pdipParams.enabled)
   if (cacheParams.pdipParams.enabled) {
     println("  PDIP Table Sets: " + cacheParams.pdipParams.numTableSets)
@@ -760,15 +763,15 @@ class ICacheImp(outer: ICache)
   // dataArray io
   if (outer.ctrlUnitOpt.nonEmpty) {
     val ctrlUnit = outer.ctrlUnitOpt.get.module
-    when(ctrlUnit.io.injecting) {
-      dataArray.io.write <> ctrlUnit.io.dataWrite
-      missUnit.io.data_write.ready := false.B
-    }.otherwise {
-      ctrlUnit.io.dataWrite.ready := false.B
-      dataArray.io.write <> missUnit.io.data_write
-    }
+    dataArray.io.write.valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.dataWrite.valid, missUnit.io.data_write.valid)
+    dataArray.io.write.bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.dataWrite.bits, missUnit.io.data_write.bits)
+    ctrlUnit.io.dataWrite.ready := Mux(ctrlUnit.io.injecting, dataArray.io.write.ready, false.B)
+    missUnit.io.data_write.ready := Mux(ctrlUnit.io.injecting, false.B, dataArray.io.write.ready)
   } else {
-    dataArray.io.write <> missUnit.io.data_write
+    // Use signal-level assignments instead of <> to maintain consistency
+    dataArray.io.write.valid := missUnit.io.data_write.valid
+    dataArray.io.write.bits := missUnit.io.data_write.bits
+    missUnit.io.data_write.ready := dataArray.io.write.ready
   }
   dataArray.io.read <> mainPipe.io.dataArray.toIData
   mainPipe.io.dataArray.fromIData := dataArray.io.readResp
@@ -778,25 +781,28 @@ class ICacheImp(outer: ICache)
   metaArray.io.flush <> mainPipe.io.metaArrayFlush
 
   // metaArray read path (no prefetcher, so simplify)
-  private val dummy_read_req =
-    0.U.asTypeOf(Flipped(Decoupled(new ICacheReadBundle)))
-
   if (outer.ctrlUnitOpt.nonEmpty) {
     val ctrlUnit = outer.ctrlUnitOpt.get.module
-    when(ctrlUnit.io.injecting) {
-      metaArray.io.write <> ctrlUnit.io.metaWrite
-      metaArray.io.read <> ctrlUnit.io.metaRead
-      missUnit.io.meta_write.ready := false.B
-    }.otherwise {
-      ctrlUnit.io.metaWrite.ready := false.B
-      ctrlUnit.io.metaRead.ready := false.B
-      metaArray.io.write <> missUnit.io.meta_write
-      metaArray.io.read <> dummy_read_req // No prefetcher meta reads
-    }
+    // Multiplexed write connections
+    metaArray.io.write.valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaWrite.valid, missUnit.io.meta_write.valid)
+    metaArray.io.write.bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaWrite.bits, missUnit.io.meta_write.bits)
+    ctrlUnit.io.metaWrite.ready := Mux(ctrlUnit.io.injecting, metaArray.io.write.ready, false.B)
+    missUnit.io.meta_write.ready := Mux(ctrlUnit.io.injecting, false.B, metaArray.io.write.ready)
+    
+    // Multiplexed read connections - when injecting, use ctrlUnit; otherwise tie off
+    metaArray.io.read.valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaRead.valid, false.B)
+    metaArray.io.read.bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaRead.bits, 0.U.asTypeOf(new ICacheReadBundle()))
+    ctrlUnit.io.metaRead.ready := Mux(ctrlUnit.io.injecting, metaArray.io.read.ready, false.B)
+    
     ctrlUnit.io.metaReadResp := metaArray.io.readResp
   } else {
-    metaArray.io.write <> missUnit.io.meta_write
-    metaArray.io.read <> dummy_read_req // No prefetcher meta reads
+    // Use signal-level assignments instead of <> to maintain consistency
+    metaArray.io.write.valid := missUnit.io.meta_write.valid
+    metaArray.io.write.bits := missUnit.io.meta_write.bits
+    missUnit.io.meta_write.ready := metaArray.io.write.ready
+    
+    metaArray.io.read.valid := false.B
+    metaArray.io.read.bits := 0.U.asTypeOf(new ICacheReadBundle())
   }
 
   // PDIP Prefetching only (no FDIP/IPrefetch)
@@ -814,12 +820,41 @@ class ICacheImp(outer: ICache)
   missUnit.io.fencei := io.fencei
   missUnit.io.flush := io.flush
   missUnit.io.fetch_req <> mainPipe.io.mshr.req
-  // PDIP provides all prefetch requests (FDIP removed)
-  missUnit.io.prefetch_req <> pdipController.io.prefetchReq
-  pdipController.io.prefetchReq.ready := missUnit.io.prefetch_req.ready
-  missUnit.io.mem_grant.valid := false.B
-  missUnit.io.mem_grant.bits := DontCare
-  missUnit.io.mem_grant <> bus.d
+  // PDIP provides all prefetch requests (through dedicated pipe)
+  pdipPrefetchPipe.io.enable := cacheParams.pdipParams.enabled.B && io.csr_pf_enable
+  pdipPrefetchPipe.io.flush := io.flush || io.fencei
+
+  // feed virtual addresses from controller into the pipe
+  pdipPrefetchPipe.io.in <> pdipController.io.prefetchVaddr
+  missUnit.io.prefetch_req <> pdipPrefetchPipe.io.out
+
+  // PDIP prefetch pipe uses dedicated PMP#2 and ITLB#0 ports
+  io.pmp(2) <> pdipPrefetchPipe.io.pmp
+  io.itlb(0) <> pdipPrefetchPipe.io.itlb
+
+// ----------------------------------------------------------------------------
+// unused ports
+// ----------------------------------------------------------------------------
+  // PMP#3 and ITLB#1 are now unused; tie them off below
+
+// ----------------------------------------------------------------------------
+// Tie off ONLY the truly-unused ports (do this ONCE in the file)
+// - PMP#2,#3 unused
+// - PMP#3 unused, ITLB#1 unused
+// ----------------------------------------------------------------------------
+  io.pmp(3).req.valid := false.B
+  io.pmp(3).req.bits := 0.U.asTypeOf(new PMPReqBundle())
+  // ITLB0 is used by PDIPPrefetchPipe, so leave it connected above
+  io.itlb(1).req.valid := false.B
+  io.itlb(1).req.bits := DontCare
+  io.itlb(1).req_kill := false.B
+  io.itlb(1).resp.ready := false.B
+  io.itlbFlushPipe := false.B
+
+
+  missUnit.io.mem_grant.valid := bus.d.valid
+  missUnit.io.mem_grant.bits := bus.d.bits
+  bus.d.ready := missUnit.io.mem_grant.ready
 
   mainPipe.io.flush := io.flush
   mainPipe.io.respStall := io.stop
@@ -836,20 +871,15 @@ class ICacheImp(outer: ICache)
   replacer.io.touch <> mainPipe.io.touch
   replacer.io.victim <> missUnit.io.victim
 
+// mainPipe uses PMP ports #0/#1
   io.pmp(0) <> mainPipe.io.pmp(0)
   io.pmp(1) <> mainPipe.io.pmp(1)
-  // io.pmp(2) and io.pmp(3) are unused without prefetcher
 
-  io.itlb(0).req.valid := false.B // No ITLB requests from prefetcher
-  io.itlb(0).req.bits := DontCare
-  io.itlb(1).req.valid := false.B // No ITLB requests from prefetcher
-  io.itlb(1).req.bits := DontCare
-  // ITLB resp signals don't need to be handled
+  io.itlbFlushPipe := false.B
 
   // FEC Tracker connections
-  fecTracker.io.newMiss.valid := false.B // Not used - FECTracker uses stalls/retires instead
-  // Convert mainPipe stall info to tracker format
-  // Any valid stall from either port indicates the FTQ entry is stalled
+  fecTracker.io.newMiss <> mainPipe.io.fecNewMiss // Convert mainPipe stall info to tracker format
+  // Any valid stallI from either port indicates the FTQ entry is stalled
   private val anyStall = mainPipe.io.fetch.stallInfo.map(_.valid).reduce(_ || _)
   fecTracker.io.stallUpdate.valid := anyStall
   fecTracker.io.stallUpdate.bits.ftqIdx := Mux(
@@ -899,7 +929,9 @@ class ICacheImp(outer: ICache)
   io.toIFU := mainPipe.io.fetch.req.ready
   io.perfInfo := mainPipe.io.perfInfo
 
-  io.fetch.resp <> mainPipe.io.fetch.resp
+  io.fetch.resp := mainPipe.io.fetch.resp
+  // forward stall info from main pipe to external IFU/FTQ
+  io.fetch.stallInfo := mainPipe.io.fetch.stallInfo
   io.fetch.topdownIcacheMiss := mainPipe.io.fetch.topdownIcacheMiss
   io.fetch.topdownItlbMiss := mainPipe.io.fetch.topdownItlbMiss
 

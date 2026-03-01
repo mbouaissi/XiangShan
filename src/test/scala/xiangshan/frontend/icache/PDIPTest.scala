@@ -274,20 +274,24 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       println("[PDIP Controller Test] Step 2: Trigger matching")
       dut.io.trigger.valid.poke(true.B)
       dut.io.trigger.bits.blkPaddr.poke(0x1000.U) // Same as trigger from FEC
-      dut.io.prefetchReq.ready.poke(true.B)
+      dut.io.prefetchVaddr.ready.poke(true.B)
       dut.clock.step(1)
       
-      // Check if prefetch is issued
+      // Check if prefetch is issued (vaddr)
       dut.clock.step(5) // Allow lookup and queue processing
       
-      // The prefetch request should appear
+      // The prefetch virtual address should appear
       var foundPrefetch = false
       for (_ <- 0 until 10) {
-        if (dut.io.prefetchReq.valid.peek().litToBoolean) {
+        if (dut.io.prefetchVaddr.valid.peek().litToBoolean) {
           foundPrefetch = true
-          println(s"[PDIP Controller Test] Prefetch issued for address 0x${dut.io.prefetchReq.bits.blkPaddr.peek().litValue.toString(16)}")
-          assert(dut.io.prefetchReq.bits.blkPaddr.peek().litValue == 0x2000,
-            "Prefetch address should match learned FEC line")
+          val v = dut.io.prefetchVaddr.bits.peek().litValue
+          println(s"[PDIP Controller Test] Prefetch vaddr issued 0x${v.toString(16)}")
+          // expect vaddr derived from learned blkVaddr appended with zeros
+          // learned blkVaddr computed in test: we used fecLine.blkPaddr = 0x2000, vSetIdx=0x20
+          // PDIPController reconstructs blkVaddr from table entry equal to that value, so full vaddr is (blkVaddr << blockOffBits)
+          assert((v & ~((1 << blockOffBits)-1)) === (0x2000.U << blockOffBits).litValue,
+            "Prefetch vaddr should match learned FEC line block address")
         }
         dut.clock.step(1)
       }
@@ -324,13 +328,13 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       // Trigger should eventually prefetch both
       dut.io.trigger.valid.poke(true.B)
       dut.io.trigger.bits.blkPaddr.poke(0x1000.U)
-      dut.io.prefetchReq.ready.poke(true.B)
+      dut.io.prefetchVaddr.ready.poke(true.B)
       
       var prefetchCount = 0
       for (_ <- 0 until 20) {
-        if (dut.io.prefetchReq.valid.peek().litToBoolean) {
+        if (dut.io.prefetchVaddr.valid.peek().litToBoolean) {
           prefetchCount += 1
-          println(s"[PDIP Controller Test] Prefetch #$prefetchCount issued")
+          println(s"[PDIP Controller Test] Prefetch #$prefetchCount vaddr ${dut.io.prefetchVaddr.bits.peek().litValue.toString(16)} issued")
         }
         dut.clock.step(1)
       }
