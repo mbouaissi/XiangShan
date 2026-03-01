@@ -228,34 +228,20 @@ class PrefetchQueueEntry(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool()
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W)
   val vSetIdx: UInt = UInt(idxBits.W)
-  val vaddr: UInt = UInt(VAddrBits.W) // Reconstructed virtual address
 }
 
 /** Prefetch Queue IO
   */
 class PrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
     extends ICacheBundle {
-  // Enqueue prefetch request
-  val enq = Flipped(DecoupledIO(new Bundle {
-    val blkPaddr = UInt((PAddrBits - blockOffBits).W)
-    val vSetIdx = UInt(idxBits.W)
-    val vaddr = UInt(VAddrBits.W)
-  }))
+  val enq = Flipped(DecoupledIO(new ICacheMissReq))
+  val deq = DecoupledIO(new ICacheMissReq)
 
-  // Dequeue to issue prefetch
-  val deq = DecoupledIO(new Bundle {
-    val blkPaddr = UInt((PAddrBits - blockOffBits).W)
-    val vSetIdx = UInt(idxBits.W)
-    val vaddr = UInt(VAddrBits.W)
-  })
-
-  // MSHR resource check (input from ICache)
-  val mshrAvailable = Input(Bool())
-
-  // Flush signal
   val flush = Input(Bool())
 
-  // Status
+  // notify when an MSHR is free so we only dequeue when we can allocate
+  val mshrAvailable = Input(Bool())
+
   val empty = Output(Bool())
   val full = Output(Bool())
 }
@@ -293,7 +279,6 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
     queue(tail).valid := true.B
     queue(tail).blkPaddr := io.enq.bits.blkPaddr
     queue(tail).vSetIdx := io.enq.bits.vSetIdx
-    queue(tail).vaddr := io.enq.bits.vaddr
 
     tail := tail + 1.U
     when(tail === (queueSize - 1).U) {
@@ -309,7 +294,6 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
   io.deq.valid := !empty && queue(head).valid && io.mshrAvailable
   io.deq.bits.blkPaddr := queue(head).blkPaddr
   io.deq.bits.vSetIdx := queue(head).vSetIdx
-  io.deq.bits.vaddr := queue(head).vaddr
 
   when(io.deq.fire && !io.flush) {
     queue(head).valid := false.B
@@ -397,6 +381,10 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   pdipTable.io.lookup.req.valid := io.trigger.valid && active
   pdipTable.io.lookup.req.bits.trigger := io.trigger.bits.blkPaddr
 
+  // make response fields easier to reference
+  private val targetsValid = pdipTable.io.lookup.resp.valid
+  private val targets = pdipTable.io.lookup.resp.bits
+
   // When table hit, enqueue valid targets to prefetch queue
   private val validTargetsOH = VecInit(
     targets.map(t => t.valid && (t.confidence >= 2.U))
@@ -417,10 +405,6 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && active
   prefetchQueue.io.enq.bits.blkPaddr := targets(targetSel).blkPaddr
   prefetchQueue.io.enq.bits.vSetIdx := targets(targetSel).vSetIdx
-  prefetchQueue.io.enq.bits.vaddr := reconstructVAddr(
-    targets(targetSel).blkPaddr,
-    targets(targetSel).vSetIdx
-  )
 
   // Learn from FEC line detections: allocate trigger-target associations
   pdipTable.io.allocate.valid := io.fecLine.valid && active

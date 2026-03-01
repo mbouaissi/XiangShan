@@ -815,9 +815,7 @@ class ICacheImp(outer: ICache)
   missUnit.io.flush := io.flush
   missUnit.io.fetch_req <> mainPipe.io.mshr.req
   // PDIP provides all prefetch requests (FDIP removed)
-  missUnit.io.prefetch_req.valid := pdipController.io.prefetchReq.valid
-  missUnit.io.prefetch_req.bits.blkPaddr := pdipController.io.prefetchReq.bits.blkPaddr
-  missUnit.io.prefetch_req.bits.vSetIdx := pdipController.io.prefetchReq.bits.vSetIdx
+  missUnit.io.prefetch_req <> pdipController.io.prefetchReq
   pdipController.io.prefetchReq.ready := missUnit.io.prefetch_req.ready
   missUnit.io.mem_grant.valid := false.B
   missUnit.io.mem_grant.bits := DontCare
@@ -868,6 +866,9 @@ class ICacheImp(outer: ICache)
   }
   // Provide trigger address from FTQ (current instruction fetch address)
   // PDIP uses this to form trigger patterns when learning from FEC lines
+  // Use FTQ prefetch request as a proxy for the current fetch address.
+  // The prefetch interface is still driven (ready=1) but never actually
+  // carries FDIP requests; PDIP only needs the startAddr field.
   private val currentFetchBlkPaddr =
     io.ftqPrefetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
   fecTracker.io.triggerAddr := currentFetchBlkPaddr
@@ -877,13 +878,15 @@ class ICacheImp(outer: ICache)
   // PDIP Controller connections - Pattern-Directed Instruction Prefetching
   // ============================================================================
   pdipController.io.enable := cacheParams.pdipParams.enabled.B && io.csr_pf_enable
-  pdipController.io.flush  := io.flush || io.fencei   // often fence.i should flush prefetcher state too
+  pdipController.io.flush := io.flush || io.fencei // often fence.i should flush prefetcher state too
 
   // Trigger from current instruction fetch
   // PDIP learns trigger patterns from the instruction block addresses
-  pdipController.io.trigger.valid := io.fetch.req.valid && pdipController.io.enable
-  pdipController.io.trigger.bits.blkPaddr := io.fetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
-
+  pdipController.io.trigger.valid := io.ftqPrefetch.req.valid && pdipController.io.enable
+  pdipController.io.trigger.bits.blkPaddr := io.ftqPrefetch.req.bits.startAddr(
+    PAddrBits - 1,
+    blockOffBits
+  )
 
   // Learn from FEC line detections
   // When FECTracker detects a FEC (Front-End Critical) line, PDIP learns this association
@@ -891,7 +894,7 @@ class ICacheImp(outer: ICache)
 
   // MSHR availability check
   pdipController.io.mshrAvailable := missUnit.io.prefetch_req.ready
-  
+
   // notify IFU that Icache pipeline is available
   io.toIFU := mainPipe.io.fetch.req.ready
   io.perfInfo := mainPipe.io.perfInfo
