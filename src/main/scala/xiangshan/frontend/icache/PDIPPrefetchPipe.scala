@@ -13,8 +13,8 @@ class PDIPPrefetchPipe(implicit p: Parameters) extends ICacheModule {
     val enable = Input(Bool())
     val flush  = Input(Bool())
 
-    // PDIP provides virtual, block-aligned address
-    val in = Flipped(DecoupledIO(UInt(VAddrBits.W)))
+    // PDIP provides prefetch entry with block address and virtual set index
+    val in = Flipped(DecoupledIO(new PrefetchEntry))
 
     // To missUnit as prefetch req
     val out = DecoupledIO(new ICacheMissReq)
@@ -37,7 +37,7 @@ class PDIPPrefetchPipe(implicit p: Parameters) extends ICacheModule {
   io.itlb.req.valid := false.B
   io.itlb.req.bits  := 0.U.asTypeOf(new TlbReq)
   io.itlb.req_kill  := io.flush
-  io.itlb.resp.ready := false.B
+  io.itlb.resp.ready := true.B  // non-blocking TLB port: must always be true
 
   io.pmp.req.valid := false.B
   io.pmp.req.bits  := 0.U.asTypeOf(new PMPReqBundle())
@@ -51,9 +51,11 @@ class PDIPPrefetchPipe(implicit p: Parameters) extends ICacheModule {
   }
   private val state = RegInit(State.idle)
 
-  private val vaddrReg = RegInit(0.U(VAddrBits.W))
-  private val paddrReg = RegInit(0.U(PAddrBits.W))
-  private val pbmtReg  = RegInit(Pbmt.pma)
+  private val vaddrReg    = RegInit(0.U(VAddrBits.W))
+  private val vSetIdxReg  = RegInit(0.U(idxBits.W))
+  // blkPaddrReg removed: the pre-TLB hint is not used; blkPaddr is derived from
+  // the TLB-translated paddr directly in waitTlb.
+  // paddrReg / pbmtReg removed: used combinationally from the ITLB response.
 
   private def isUncache(pbmt: UInt): Bool = Pbmt.isUncache(pbmt)
 
@@ -61,81 +63,101 @@ class PDIPPrefetchPipe(implicit p: Parameters) extends ICacheModule {
   private val active = io.enable && !io.flush
 
   // ---------------------------
-  // State machine
+  // ITLB req helper — shared between idle (speculative) and waitResp (retry)
+  // ---------------------------
+  private def driveItlbReq(vaddr: UInt): Unit = {
+    io.itlb.req.valid                    := active
+    io.itlb.req.bits.vaddr               := vaddr
+    io.itlb.req.bits.fullva              := vaddr
+    io.itlb.req.bits.checkfullva         := false.B
+    io.itlb.req.bits.cmd                 := TlbCmd.exec
+    io.itlb.req.bits.hyperinst           := false.B
+    io.itlb.req.bits.hlvx               := false.B
+    io.itlb.req.bits.size                := 3.U
+    io.itlb.req.bits.kill                := io.flush
+    io.itlb.req.bits.memidx              := 0.U.asTypeOf(new MemBlockidxBundle)
+    io.itlb.req.bits.isPrefetch          := true.B
+    io.itlb.req.bits.no_translate        := false.B
+    io.itlb.req.bits.pmp_addr            := 0.U
+    io.itlb.req.bits.debug.pc            := 0.U
+    io.itlb.req.bits.debug.robIdx        := 0.U.asTypeOf(io.itlb.req.bits.debug.robIdx)
+    io.itlb.req.bits.debug.isFirstIssue  := false.B
+  }
+
+  // ---------------------------
+  // 2-state FSM
+  //
+  //  idle      — accept input AND speculatively send ITLB req in the same cycle,
+  //              saving the extra stall cycle of the old 3-state design.
+  //  waitResp  — retry ITLB req until a non-miss response arrives, then do PMP
+  //              combinationally and emit (or drop) in the same cycle.
+  //              Dropping when the miss-unit is back-pressured is acceptable
+  //              for a prefetcher, which avoids needing a separate emit state.
   // ---------------------------
   switch(state) {
     is(State.idle) {
+      // Speculatively send the ITLB req using the incoming vaddr so we don't
+      // waste a cycle latching before requesting.
+      when(io.in.valid && active && io.itlb.req.ready) {
+        driveItlbReq(io.in.bits.vaddr)
+      }
       io.in.ready := active && io.itlb.req.ready
       when(io.in.fire) {
-        vaddrReg := io.in.bits
-        state := State.waitTlb
+        vaddrReg   := io.in.bits.vaddr
+        vSetIdxReg := io.in.bits.vSetIdx
+        state      := State.waitTlb
       }
     }
 
     is(State.waitTlb) {
-      // Send iTLB req (Decoupled)
-      io.itlb.req.valid := active
-      io.itlb.req.bits.vaddr := vaddrReg
-      io.itlb.req.bits.fullva := vaddrReg
-      io.itlb.req.bits.checkfullva := false.B
-      io.itlb.req.bits.cmd := TlbCmd.exec
-      io.itlb.req.bits.hyperinst := false.B
-      io.itlb.req.bits.hlvx := false.B
-      io.itlb.req.bits.size := 3.U
-      io.itlb.req.bits.kill := io.flush
-      io.itlb.req.bits.memidx := 0.U.asTypeOf(new MemBlockidxBundle)
-      io.itlb.req.bits.isPrefetch := true.B
-      io.itlb.req.bits.no_translate := false.B
-      io.itlb.req.bits.pmp_addr := 0.U // unused for normal translate path
-      io.itlb.req.bits.debug.pc := 0.U
-      io.itlb.req.bits.debug.robIdx := 0.U.asTypeOf(io.itlb.req.bits.debug.robIdx)
-      io.itlb.req.bits.debug.isFirstIssue := false.B
+      // Keep driving ITLB req from the latched vaddr (retry on miss).
+      driveItlbReq(vaddrReg)
 
-      // Accept resp
-      io.itlb.resp.ready := active
-
+      // resp.ready is wired true.B (non-blocking port); fire = valid.
       when(io.itlb.resp.fire) {
         val r = io.itlb.resp.bits
-        // If miss or instr PF/AF/etc, just drop this prefetch
-        val hasExcp = r.miss ||
+        val hasExcp =
           r.excp(0).pf.instr ||
           r.excp(0).af.instr ||
           r.excp(0).gpf.instr
-        when(hasExcp) {
+
+        when(r.miss) {
+          // TLB miss — stay here and retry next cycle
+        }.elsewhen(hasExcp) {
+          // Translate exception — silently drop this prefetch
           state := State.idle
         }.otherwise {
-          paddrReg := r.paddr(0)
-          pbmtReg  := r.pbmt(0)
-          state := State.emit
+          // TLB hit: do PMP combinationally with the just-received paddr and
+          // emit to the miss unit in the same cycle.
+          val paddr = r.paddr(0)
+          val pbmt  = r.pbmt(0)
+
+          io.pmp.req.valid    := active
+          io.pmp.req.bits.addr := paddr
+          io.pmp.req.bits.size := 3.U
+          io.pmp.req.bits.cmd  := TlbCmd.exec
+
+          val pmpExcp = ExceptionType.fromPMPResp(io.pmp.resp)
+          val drop    = ExceptionType.hasException(pmpExcp) ||
+                        io.pmp.resp.mmio                    ||
+                        isUncache(pbmt)
+
+          // Emit — drop if miss unit is back-pressured (acceptable for prefetcher)
+          io.out.valid          := active && !drop
+          io.out.bits.blkPaddr  := paddr(PAddrBits - 1, blockOffBits)
+          io.out.bits.vSetIdx   := vSetIdxReg
+
+          // Always retire this entry: either it fired, was dropped by PMP/MMIO,
+          // or the miss unit was full (prefetch dropped).
+          state := State.idle
         }
       }
 
-      when(io.flush) {
-        state := State.idle
-      }
+      when(io.flush) { state := State.idle }
     }
 
-    is(State.emit) {
-      // PMP check looks combinational in mainPipe style:
-      // drive req and read resp same cycle.
-      io.pmp.req.valid := active
-      io.pmp.req.bits.addr := paddrReg
-      io.pmp.req.bits.size := 3.U
-      io.pmp.req.bits.cmd  := TlbCmd.exec
-
-      val pmpExcp = ExceptionType.fromPMPResp(io.pmp.resp)
-      val pmpMmio = io.pmp.resp.mmio
-
-      val drop = ExceptionType.hasException(pmpExcp) || pmpMmio || isUncache(pbmtReg)
-
-      // Emit miss req if allowed
-      io.out.valid := active && !drop
-      io.out.bits.blkPaddr := getBlkAddr(paddrReg)
-      io.out.bits.vSetIdx  := get_idx(vaddrReg) // same helper used in mainPipe
-
-      when(io.out.fire || drop || io.flush) {
-        state := State.idle
-      }
-    }
+    // State.emit is now unused; kept in the Enum to avoid renumbering
+    // but will be optimised away by the compiler.
+    is(State.emit) { state := State.idle }
   }
 }

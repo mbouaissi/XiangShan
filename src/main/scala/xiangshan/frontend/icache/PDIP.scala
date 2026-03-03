@@ -98,7 +98,7 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     )
   ).asUInt
 
-  private val hitWay = OHToUInt(matchWay)
+  private val hitWay = PriorityEncoder(matchWay) // PriorityEncoder is safe even if >1 bit set
   private val hit = matchWay =/= 0.U
 
   // Output targets if hit
@@ -122,7 +122,7 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
       )
     ).asUInt
 
-    val existingWay = OHToUInt(existingWayOH)
+    val existingWay = PriorityEncoder(existingWayOH) // PriorityEncoder is safe even if >1 bit set
     val triggerExists = existingWayOH =/= 0.U
 
     when(triggerExists) {
@@ -227,6 +227,13 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
 
 /** Prefetch Queue Entry
   */
+class PrefetchEntry(implicit p: Parameters) extends ICacheBundle {
+  // Physical address used directly (PDIP learns from FEC which already has physical addresses).
+  val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W)
+  val vSetIdx: UInt  = UInt(log2Ceil(nSets).W)
+  val vaddr: UInt    = UInt(VAddrBits.W) // kept for debugging / potential future use
+}
+
 class PrefetchQueueEntry(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool()
   val vaddr: UInt = UInt(VAddrBits.W)
@@ -236,8 +243,8 @@ class PrefetchQueueEntry(implicit p: Parameters) extends ICacheBundle {
   */
 class PrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
     extends ICacheBundle {
-  val enq = Flipped(DecoupledIO(UInt(VAddrBits.W)))
-  val deq = DecoupledIO(UInt(VAddrBits.W))
+  val enq = Flipped(DecoupledIO(new PrefetchEntry))
+  val deq = DecoupledIO(new PrefetchEntry)
 
   val flush = Input(Bool())
   val mshrAvailable = Input(Bool())
@@ -253,7 +260,7 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
   val io: PrefetchQueueIO = IO(new PrefetchQueueIO(queueSize))
 
   private val queue = RegInit(
-    VecInit(Seq.fill(queueSize)(0.U.asTypeOf(new PrefetchQueueEntry)))
+    VecInit(Seq.fill(queueSize)(0.U.asTypeOf(new PrefetchEntry)))
   )
 
   private val head = RegInit(0.U(log2Ceil(queueSize).W))
@@ -270,8 +277,7 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
   // Enqueue
   io.enq.ready := !full
   when(io.enq.fire && !io.flush) {
-    queue(tail).valid := true.B
-    queue(tail).vaddr := io.enq.bits
+    queue(tail) := io.enq.bits
 
     val tailNext = Mux(tail === (queueSize - 1).U, 0.U, tail + 1.U)
     tail := tailNext
@@ -280,12 +286,10 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
   }
 
   // Dequeue (only when MSHR available)
-  io.deq.valid := !empty && queue(head).valid && io.mshrAvailable
-  io.deq.bits := queue(head).vaddr
+  io.deq.valid := !empty && io.mshrAvailable
+  io.deq.bits := queue(head)
 
   when(io.deq.fire && !io.flush) {
-    queue(head).valid := false.B
-
     val headNext = Mux(head === (queueSize - 1).U, 0.U, head + 1.U)
     head := headNext
 
@@ -294,7 +298,6 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
 
   // Flush
   when(io.flush) {
-    queue.foreach(_.valid := false.B)
     head := 0.U
     tail := 0.U
     maybe_full := false.B
@@ -320,7 +323,7 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
   }))
 
   // Output: Prefetch request to ICache
-  val prefetchVaddr: DecoupledIO[UInt] = DecoupledIO(UInt(VAddrBits.W))
+  val prefetchVaddr: DecoupledIO[PrefetchEntry] = DecoupledIO(new PrefetchEntry)
   // MSHR availability check
   val mshrAvailable = Input(Bool())
 
@@ -372,7 +375,9 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   // Enqueue one chosen target each cycle (simple)
   prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && active
   val vaddr = Cat(targets(targetSel).blkVaddr, 0.U(blockOffBits.W))
-  prefetchQueue.io.enq.bits := vaddr
+  prefetchQueue.io.enq.bits.blkPaddr := targets(targetSel).blkPaddr
+  prefetchQueue.io.enq.bits.vSetIdx  := targets(targetSel).vSetIdx
+  prefetchQueue.io.enq.bits.vaddr    := vaddr
 
   // Learn from FEC line detections: allocate trigger-target associations
   // Since fecLine doesn't carry blkVaddr, reconstruct a best-effort blkVaddr from (blkPaddr, vSetIdx).

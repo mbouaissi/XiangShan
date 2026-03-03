@@ -740,13 +740,13 @@ class ICacheImp(outer: ICache)
   private val mainPipe = Module(new ICacheMainPipe)
   private val missUnit = Module(new ICacheMissUnit(edge))
   private val replacer = Module(new ICacheReplacer)
+  private val prefetcher = Module(new IPrefetchPipe)
   private val wayLookup = Module(new WayLookup)
   private val fecTracker = Module(new FECTracker(numEntries = 16))
   private val pdipController = Module(
     new PDIPController(cacheParams.pdipParams)
   )
-  // PDIPPrefetchPipe translates PDIP controller virtual addresses to miss requests
-  private val pdipPrefetchPipe = Module(new PDIPPrefetchPipe)
+  // No PDIPPrefetchPipe: PDIP controller emits physical addresses directly (no TLB needed)
   println("  PDIP Enabled: " + cacheParams.pdipParams.enabled)
   if (cacheParams.pdipParams.enabled) {
     println("  PDIP Table Sets: " + cacheParams.pdipParams.numTableSets)
@@ -763,8 +763,15 @@ class ICacheImp(outer: ICache)
   // dataArray io
   if (outer.ctrlUnitOpt.nonEmpty) {
     val ctrlUnit = outer.ctrlUnitOpt.get.module
-    dataArray.io.write.valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.dataWrite.valid, missUnit.io.data_write.valid)
-    dataArray.io.write.bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.dataWrite.bits, missUnit.io.data_write.bits)
+    // Use Wires to help Chisel properly initialize all signal paths
+    val data_write_valid = Wire(Bool())
+    val data_write_bits = Wire(new ICacheDataWriteBundle())
+    
+    data_write_valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.dataWrite.valid, missUnit.io.data_write.valid)
+    data_write_bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.dataWrite.bits, missUnit.io.data_write.bits)
+    dataArray.io.write.valid := data_write_valid
+    dataArray.io.write.bits := data_write_bits
+    
     ctrlUnit.io.dataWrite.ready := Mux(ctrlUnit.io.injecting, dataArray.io.write.ready, false.B)
     missUnit.io.data_write.ready := Mux(ctrlUnit.io.injecting, false.B, dataArray.io.write.ready)
   } else {
@@ -780,76 +787,141 @@ class ICacheImp(outer: ICache)
   metaArray.io.flushAll := io.fencei
   metaArray.io.flush <> mainPipe.io.metaArrayFlush
 
-  // metaArray read path (no prefetcher, so simplify)
+  // metaArray read path (IPrefetchPipe reads meta; ctrlUnit overrides when injecting)
   if (outer.ctrlUnitOpt.nonEmpty) {
     val ctrlUnit = outer.ctrlUnitOpt.get.module
-    // Multiplexed write connections
-    metaArray.io.write.valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaWrite.valid, missUnit.io.meta_write.valid)
-    metaArray.io.write.bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaWrite.bits, missUnit.io.meta_write.bits)
+    // Use Wires for write connections
+    val meta_write_valid = Wire(Bool())
+    val meta_write_bits = Wire(new ICacheMetaWriteBundle())
+
+    meta_write_valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaWrite.valid, missUnit.io.meta_write.valid)
+    meta_write_bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaWrite.bits, missUnit.io.meta_write.bits)
+    metaArray.io.write.valid := meta_write_valid
+    metaArray.io.write.bits := meta_write_bits
+
     ctrlUnit.io.metaWrite.ready := Mux(ctrlUnit.io.injecting, metaArray.io.write.ready, false.B)
     missUnit.io.meta_write.ready := Mux(ctrlUnit.io.injecting, false.B, metaArray.io.write.ready)
-    
-    // Multiplexed read connections - when injecting, use ctrlUnit; otherwise tie off
-    metaArray.io.read.valid := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaRead.valid, false.B)
-    metaArray.io.read.bits := Mux(ctrlUnit.io.injecting, ctrlUnit.io.metaRead.bits, 0.U.asTypeOf(new ICacheReadBundle()))
-    ctrlUnit.io.metaRead.ready := Mux(ctrlUnit.io.injecting, metaArray.io.read.ready, false.B)
-    
+
+    when(ctrlUnit.io.injecting) {
+      metaArray.io.read <> ctrlUnit.io.metaRead
+      prefetcher.io.metaRead.toIMeta.ready := false.B
+    }.otherwise {
+      ctrlUnit.io.metaRead.ready := false.B
+      metaArray.io.read <> prefetcher.io.metaRead.toIMeta
+    }
     ctrlUnit.io.metaReadResp := metaArray.io.readResp
   } else {
-    // Use signal-level assignments instead of <> to maintain consistency
-    metaArray.io.write.valid := missUnit.io.meta_write.valid
-    metaArray.io.write.bits := missUnit.io.meta_write.bits
-    missUnit.io.meta_write.ready := metaArray.io.write.ready
-    
-    metaArray.io.read.valid := false.B
-    metaArray.io.read.bits := 0.U.asTypeOf(new ICacheReadBundle())
+    metaArray.io.write <> missUnit.io.meta_write
+    metaArray.io.read <> prefetcher.io.metaRead.toIMeta
   }
+  prefetcher.io.metaRead.fromIMeta := metaArray.io.readResp
 
-  // PDIP Prefetching only (no FDIP/IPrefetch)
-  // cache softPrefetch - acknowledged but not used (PDIP learns patterns instead)
+  // IPrefetchPipe: FTQ-driven prefetch — does TLB + meta lookup, writes WayLookup
+  prefetcher.io.flush         := io.flush
+  prefetcher.io.csr_pf_enable := io.csr_pf_enable
+  prefetcher.io.ecc_enable    := ecc_enable
+  prefetcher.io.MSHRResp      := missUnit.io.fetch_resp
+  prefetcher.io.flushFromBpu  := io.ftqPrefetch.flushFromBpu
+
+  // cache softPrefetch
   private val softPrefetchValid = RegInit(false.B)
+  private val softPrefetch      = RegInit(0.U.asTypeOf(new IPrefetchReq))
   when(io.softPrefetch.map(_.valid).reduce(_ || _)) {
     softPrefetchValid := true.B
-  }.elsewhen(true.B) {
+    softPrefetch.fromSoftPrefetch(MuxCase(
+      0.U.asTypeOf(new SoftIfetchPrefetchBundle),
+      io.softPrefetch.map(req => req.valid -> req.bits)
+    ))
+  }.elsewhen(prefetcher.io.req.fire) {
     softPrefetchValid := false.B
   }
-  // FTQ Prefetch requests are acknowledged to maintain flow but not used by PDIP
-  io.ftqPrefetch.req.ready := true.B // Always ready - PDIP learns from trigger patterns instead
+  // pass ftqPrefetch to IPrefetchPipe
+  private val ftqPrefetch = WireInit(0.U.asTypeOf(new IPrefetchReq))
+  ftqPrefetch.fromFtqICacheInfo(io.ftqPrefetch.req.bits)
+  prefetcher.io.req.valid                 := softPrefetchValid || io.ftqPrefetch.req.valid
+  prefetcher.io.req.bits                  := Mux(softPrefetchValid, softPrefetch, ftqPrefetch)
+  prefetcher.io.req.bits.backendException := io.ftqPrefetch.backendException
+  io.ftqPrefetch.req.ready                := prefetcher.io.req.ready && !softPrefetchValid
 
   missUnit.io.hartId := io.hartId
   missUnit.io.fencei := io.fencei
-  missUnit.io.flush := io.flush
+  missUnit.io.flush  := io.flush
   missUnit.io.fetch_req <> mainPipe.io.mshr.req
-  // PDIP provides all prefetch requests (through dedicated pipe)
-  pdipPrefetchPipe.io.enable := cacheParams.pdipParams.enabled.B && io.csr_pf_enable
-  pdipPrefetchPipe.io.flush := io.flush || io.fencei
 
-  // feed virtual addresses from controller into the pipe
-  pdipPrefetchPipe.io.in <> pdipController.io.prefetchVaddr
-  missUnit.io.prefetch_req <> pdipPrefetchPipe.io.out
+  // Prefetch arbitration: PDIP has higher priority; IPrefetchPipe (FDIP) fills in when PDIP is idle.
+  // PDIP emits physical addresses directly (blkPaddr from its table), no TLB needed.
+  private val pdipActive = cacheParams.pdipParams.enabled.B && io.csr_pf_enable
+  private val pdipReq    = pdipController.io.prefetchVaddr
 
-  // PDIP prefetch pipe uses dedicated PMP#2 and ITLB#0 ports
-  io.pmp(2) <> pdipPrefetchPipe.io.pmp
-  io.itlb(0) <> pdipPrefetchPipe.io.itlb
+  // ============================================================================
+  // Shadow tag array: mirrors ICacheMetaArray valid+tag state for PDIP hit check.
+  // Prevents PDIP from re-requesting blocks already resident in the ICache,
+  // which would cause metaArray aliasing (multi-hit assertion in IPrefetch.scala).
+  // tagBits = PAddrBits - pgUntagBits (inherited from HasL1CacheParameters).
+  // ============================================================================
+  private val shadowTagValid = RegInit(VecInit.fill(ICacheSets)(VecInit.fill(ICacheWays)(false.B)))
+  private val shadowPhyTags  = Reg(Vec(ICacheSets, Vec(ICacheWays, UInt(tagBits.W))))
 
-// ----------------------------------------------------------------------------
-// unused ports
-// ----------------------------------------------------------------------------
-  // PMP#3 and ITLB#1 are now unused; tie them off below
+  // Update shadow on every meta array write (refill from missUnit or ECC injection).
+  // fire = valid && ready, so this triggers exactly when the real array updates.
+  when(metaArray.io.write.fire) {
+    val wIdx  = metaArray.io.write.bits.virIdx
+    val wTag  = metaArray.io.write.bits.phyTag
+    val wMask = metaArray.io.write.bits.waymask.asBools
+    (0 until ICacheWays).foreach { w =>
+      when(wMask(w)) {
+        shadowTagValid(wIdx)(w) := !metaArray.io.write.bits.poison
+        shadowPhyTags(wIdx)(w)  := wTag
+      }
+    }
+  }
 
-// ----------------------------------------------------------------------------
-// Tie off ONLY the truly-unused ports (do this ONCE in the file)
-// - PMP#2,#3 unused
-// - PMP#3 unused, ITLB#1 unused
-// ----------------------------------------------------------------------------
-  io.pmp(3).req.valid := false.B
-  io.pmp(3).req.bits := 0.U.asTypeOf(new PMPReqBundle())
-  // ITLB0 is used by PDIPPrefetchPipe, so leave it connected above
-  io.itlb(1).req.valid := false.B
-  io.itlb(1).req.bits := DontCare
-  io.itlb(1).req_kill := false.B
-  io.itlb(1).resp.ready := false.B
-  io.itlbFlushPipe := false.B
+  // Mirror per-way flushes driven by mainPipe (e.g. ECC eviction).
+  (0 until PortNumber).foreach { i =>
+    when(mainPipe.io.metaArrayFlush(i).valid) {
+      val fIdx  = mainPipe.io.metaArrayFlush(i).bits.virIdx
+      val fMask = mainPipe.io.metaArrayFlush(i).bits.waymask.asBools
+      (0 until ICacheWays).foreach { w =>
+        when(fMask(w)) { shadowTagValid(fIdx)(w) := false.B }
+      }
+    }
+  }
+
+  // Full flush on fencei — placed after write/flush whens so it takes last-wins priority.
+  when(io.fencei) {
+    shadowTagValid.foreach(_.foreach(_ := false.B))
+  }
+
+  // PDIP cache-hit gate: drop the PDIP request silently if the block is already
+  // present in the shadow cache (i.e. already has a valid tag in the meta array).
+  private val pdipPtag      = getPhyTagFromBlk(pdipReq.bits.blkPaddr)
+  private val pdipShadowHit = VecInit((0 until ICacheWays).map { w =>
+    shadowTagValid(pdipReq.bits.vSetIdx)(w) && (shadowPhyTags(pdipReq.bits.vSetIdx)(w) === pdipPtag)
+  }).reduce(_ || _)
+
+  missUnit.io.prefetch_req.valid := (pdipReq.valid && pdipActive && !pdipShadowHit) ||
+                                    prefetcher.io.MSHRReq.valid
+  missUnit.io.prefetch_req.bits  := Mux(
+    pdipReq.valid && pdipActive && !pdipShadowHit,
+    // Convert PrefetchEntry to ICacheMissReq using physical address from PDIP table
+    { val r = Wire(new ICacheMissReq)
+      r.blkPaddr := pdipReq.bits.blkPaddr
+      r.vSetIdx  := pdipReq.bits.vSetIdx
+      r },
+    prefetcher.io.MSHRReq.bits
+  )
+  // Consume PDIP request when missUnit accepts it, OR drop it immediately on a shadow hit.
+  pdipReq.ready                     := missUnit.io.prefetch_req.ready || pdipShadowHit
+  prefetcher.io.MSHRReq.ready       := missUnit.io.prefetch_req.ready && !(pdipReq.valid && pdipActive && !pdipShadowHit)
+
+  // TLB ports: both used by IPrefetchPipe
+  io.itlb(0) <> prefetcher.io.itlb(0)
+  io.itlb(1) <> prefetcher.io.itlb(1)
+  io.itlbFlushPipe := prefetcher.io.itlbFlushPipe
+
+  // PMP ports: mainPipe(0,1), IPrefetchPipe(2,3)
+  io.pmp(2) <> prefetcher.io.pmp(0)
+  io.pmp(3) <> prefetcher.io.pmp(1)
 
 
   missUnit.io.mem_grant.valid := bus.d.valid
@@ -864,18 +936,15 @@ class ICacheImp(outer: ICache)
   mainPipe.io.fetch.req <> io.fetch.req
   mainPipe.io.wayLookupRead <> wayLookup.io.read
 
-  wayLookup.io.flush := io.flush
-  wayLookup.io.write.valid := false.B // No writes from prefetcher (PDIP doesn't update wayLook)
+  wayLookup.io.flush  := io.flush
+  wayLookup.io.write  <> prefetcher.io.wayLookupWrite
   wayLookup.io.update := missUnit.io.fetch_resp
 
   replacer.io.touch <> mainPipe.io.touch
   replacer.io.victim <> missUnit.io.victim
 
-// mainPipe uses PMP ports #0/#1
   io.pmp(0) <> mainPipe.io.pmp(0)
   io.pmp(1) <> mainPipe.io.pmp(1)
-
-  io.itlbFlushPipe := false.B
 
   // FEC Tracker connections
   fecTracker.io.newMiss <> mainPipe.io.fecNewMiss // Convert mainPipe stall info to tracker format
@@ -894,13 +963,11 @@ class ICacheImp(outer: ICache)
     fecTracker.io.retireUpdate(i).valid := io.rob_commits(i).valid
     fecTracker.io.retireUpdate(i).bits.ftqIdx := io.rob_commits(i).bits.ftqIdx
   }
-  // Provide trigger address from FTQ (current instruction fetch address)
-  // PDIP uses this to form trigger patterns when learning from FEC lines
-  // Use FTQ prefetch request as a proxy for the current fetch address.
-  // The prefetch interface is still driven (ready=1) but never actually
-  // carries FDIP requests; PDIP only needs the startAddr field.
-  private val currentFetchBlkPaddr =
-    io.ftqPrefetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
+  // Provide trigger address from the ITLB response of IPrefetchPipe (block-accurate paddr)
+  private val currentFetchBlkPaddr = Cat(
+    prefetcher.io.itlb(0).resp.bits.paddr(0)(PAddrBits - 1, blockOffBits),
+    0.U(blockOffBits.W)
+  )(PAddrBits - 1, blockOffBits)
   fecTracker.io.triggerAddr := currentFetchBlkPaddr
   fecTracker.io.flush := io.flush
 
@@ -913,17 +980,15 @@ class ICacheImp(outer: ICache)
   // Trigger from current instruction fetch
   // PDIP learns trigger patterns from the instruction block addresses
   pdipController.io.trigger.valid := io.ftqPrefetch.req.valid && pdipController.io.enable
-  pdipController.io.trigger.bits.blkPaddr := io.ftqPrefetch.req.bits.startAddr(
-    PAddrBits - 1,
-    blockOffBits
-  )
+  pdipController.io.trigger.bits.blkPaddr := io.ftqPrefetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
 
   // Learn from FEC line detections
   // When FECTracker detects a FEC (Front-End Critical) line, PDIP learns this association
   pdipController.io.fecLine <> fecTracker.io.fecLine
 
-  // MSHR availability check
-  pdipController.io.mshrAvailable := missUnit.io.prefetch_req.ready
+  // MSHR availability check — use RegNext to break the combinational cycle:
+  // pdipReq.valid -> prefetch_req.bits -> prefetch_req.ready -> mshrAvailable -> pdipReq.valid
+  pdipController.io.mshrAvailable := RegNext(missUnit.io.prefetch_req.ready, true.B)
 
   // notify IFU that Icache pipeline is available
   io.toIFU := mainPipe.io.fetch.req.ready

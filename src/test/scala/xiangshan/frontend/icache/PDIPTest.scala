@@ -13,6 +13,8 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.chipsalliance.cde.config.Parameters
 import xiangshan._
 import top.DefaultConfig
+import xiangshan.cache._
+import scala.math.log
 
 class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
   
@@ -21,6 +23,8 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
   implicit val p: Parameters = defaultConfig.alterPartial({
     case XSCoreParamsKey => defaultConfig(XSTileKey).head
   })
+  
+  val blockOffBits = 6 // log2(64) for 64-byte blocks
   
   val pdipParams = PDIPParams(
     enabled = true,
@@ -195,7 +199,6 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       
       // Enqueue a request
       dut.io.enq.valid.poke(true.B)
-      dut.io.enq.bits.blkPaddr.poke(0x1000.U)
       dut.io.enq.bits.vSetIdx.poke(0x10.U)
       dut.io.enq.bits.vaddr.poke(0x80001000L.U)
       dut.clock.step(1)
@@ -205,7 +208,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       
       // Dequeue should be valid
       assert(dut.io.deq.valid.peek().litToBoolean, "Dequeue should be valid")
-      assert(dut.io.deq.bits.blkPaddr.peek().litValue == 0x1000, "Dequeued address should match")
+      assert(dut.io.deq.bits.vaddr.peek().litValue == 0x80001000L, "Dequeued vaddr should match")
       
       dut.io.deq.ready.poke(true.B)
       dut.clock.step(1)
@@ -225,7 +228,6 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       
       // Enqueue a request
       dut.io.enq.valid.poke(true.B)
-      dut.io.enq.bits.blkPaddr.poke(0x1000.U)
       dut.io.enq.bits.vSetIdx.poke(0x10.U)
       dut.io.enq.bits.vaddr.poke(0x80001000L.U)
       dut.io.mshrAvailable.poke(true.B)
