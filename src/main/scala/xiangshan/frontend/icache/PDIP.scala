@@ -83,13 +83,8 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     )
   )
 
-  // Compute set index from trigger address
-  private def getSetIdx(trigger: UInt): UInt = {
-    trigger(log2Ceil(params.numTableSets) - 1, 0)
-  }
-
   // Lookup logic (combinational)
-  private val lookupSet = table(getSetIdx(io.lookup.req.bits.trigger))
+  private val lookupSet = table(io.lookup.req.bits.trigger(log2Ceil(params.numTableSets) - 1, 0))
 
   // Find matching way
   private val matchWay = VecInit(
@@ -98,7 +93,9 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     )
   ).asUInt
 
-  private val hitWay = PriorityEncoder(matchWay) // PriorityEncoder is safe even if >1 bit set
+  private val hitWay = PriorityEncoder(
+    matchWay
+  ) // PriorityEncoder is safe even if >1 bit set
   private val hit = matchWay =/= 0.U
 
   // Output targets if hit
@@ -112,7 +109,8 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
 
   // Allocation logic
   when(io.allocate.valid && !io.flush) {
-    val allocSetIdx = getSetIdx(io.allocate.bits.trigger)
+    val allocSetIdx =
+      io.allocate.bits.trigger(log2Ceil(params.numTableSets) - 1, 0)
     val allocSet = table(allocSetIdx)
 
     // Check if trigger already exists
@@ -122,7 +120,9 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
       )
     ).asUInt
 
-    val existingWay = PriorityEncoder(existingWayOH) // PriorityEncoder is safe even if >1 bit set
+    val existingWay = PriorityEncoder(
+      existingWayOH
+    ) // PriorityEncoder is safe even if >1 bit set
     val triggerExists = existingWayOH =/= 0.U
 
     when(triggerExists) {
@@ -230,8 +230,10 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
 class PrefetchEntry(implicit p: Parameters) extends ICacheBundle {
   // Physical address used directly (PDIP learns from FEC which already has physical addresses).
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W)
-  val vSetIdx: UInt  = UInt(log2Ceil(nSets).W)
-  val vaddr: UInt    = UInt(VAddrBits.W) // kept for debugging / potential future use
+  val vSetIdx: UInt = UInt(log2Ceil(nSets).W)
+  val vaddr: UInt = UInt(
+    VAddrBits.W
+  ) // kept for debugging / potential future use
 }
 
 class PrefetchQueueEntry(implicit p: Parameters) extends ICacheBundle {
@@ -376,14 +378,14 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   prefetchQueue.io.enq.valid := targetsValid && hasValidTarget && active
   val vaddr = Cat(targets(targetSel).blkVaddr, 0.U(blockOffBits.W))
   prefetchQueue.io.enq.bits.blkPaddr := targets(targetSel).blkPaddr
-  prefetchQueue.io.enq.bits.vSetIdx  := targets(targetSel).vSetIdx
-  prefetchQueue.io.enq.bits.vaddr    := vaddr
+  prefetchQueue.io.enq.bits.vSetIdx := targets(targetSel).vSetIdx
+  prefetchQueue.io.enq.bits.vaddr := vaddr
 
   // Learn from FEC line detections: allocate trigger-target associations
   // Since fecLine doesn't carry blkVaddr, reconstruct a best-effort blkVaddr from (blkPaddr, vSetIdx).
   private def reconstructVAddr(blkPaddr: UInt, vSetIdx: UInt): UInt = {
     val blkHi = blkPaddr.getWidth - 1
-    val upper = blkPaddr(blkHi, idxBits) // <-- never out-of-range
+    val upper = blkPaddr(blkHi, idxBits)
 
     val raw = Cat(
       upper,

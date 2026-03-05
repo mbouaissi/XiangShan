@@ -746,7 +746,7 @@ class ICacheImp(outer: ICache)
   private val pdipController = Module(
     new PDIPController(cacheParams.pdipParams)
   )
-  // No PDIPPrefetchPipe: PDIP controller emits physical addresses directly (no TLB needed)
+
   println("  PDIP Enabled: " + cacheParams.pdipParams.enabled)
   if (cacheParams.pdipParams.enabled) {
     println("  PDIP Table Sets: " + cacheParams.pdipParams.numTableSets)
