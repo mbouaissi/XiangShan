@@ -626,10 +626,6 @@ class ICacheMainPipe(implicit p: Parameters)
       io.fecNewMiss.bits.blkPaddr := toMSHRArbiter.io.in(i).bits.blkPaddr
       io.fecNewMiss.bits.vSetIdx := toMSHRArbiter.io.in(i).bits.vSetIdx
       io.fecNewMiss.bits.ftqIdx := s2_req_ftqIdx
-      io.fecNewMiss.bits.blkVaddr := s2_req_vaddr(i)(
-        VAddrBits - 1,
-        blockOffBits
-      )
     }
   }
   XSPerfAccumulate("to_missUnit_stall", toMSHR.valid && !toMSHR.ready)

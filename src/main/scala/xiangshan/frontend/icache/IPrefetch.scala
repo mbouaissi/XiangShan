@@ -591,7 +591,6 @@ class IPrefetchPipe(implicit p: Parameters) extends IPrefetchModule with HasICac
   io.newMiss.bits.blkPaddr  := toMSHR.bits.blkPaddr
   io.newMiss.bits.vSetIdx   := toMSHR.bits.vSetIdx
   io.newMiss.bits.ftqIdx    := s2_req_ftqIdx
-  io.newMiss.bits.blkVaddr  := s2_req_vaddr(toMSHRArbiter.io.chosen)(VAddrBits - 1, blockOffBits)
 
   s2_flush := io.flush
 

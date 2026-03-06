@@ -9,7 +9,6 @@ import xiangshan.frontend._
 /** FEC Miss Information - signals a new cache miss to track */
 class FECMissInfo(implicit p: Parameters) extends ICacheBundle {
   val blkPaddr = UInt((PAddrBits - blockOffBits).W)
-  val blkVaddr = UInt((VAddrBits - blockOffBits).W)
   val vSetIdx = UInt(idxBits.W)
   val ftqIdx = new FtqPtr
 }
@@ -25,18 +24,16 @@ class FECRetireInfo(implicit p: Parameters) extends ICacheBundle {
   val ftqIdx = new FtqPtr
 }
 
-/** Front-End Critical (FEC) Line Candidate Entry Tracks cache lines that miss
-  * and potentially cause stalls
+/** FEC Line Candidate Entry
   */
 class FECCandidateEntry(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool() // entry allocated
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W) // block address
-  val blkVaddr: UInt = UInt((VAddrBits - blockOffBits).W)
-  val vSetIdx: UInt = UInt(idxBits.W) // L1I set index
-  val ftqIdx: FtqPtr = new FtqPtr // Associated FTQ entry index
-  val allocTime: UInt = UInt(64.W) // Cycle when allocated, for aging
-  val stalledIFU: Bool = Bool() // Confirmed this miss stalled frontend
-  val retired: Bool = Bool() // At least one instruction retired
+  val vSetIdx: UInt = UInt(idxBits.W) // ICache set index
+  val ftqIdx: FtqPtr = new FtqPtr // FTQ entry that caused the miss
+  val allocTime: UInt = UInt(64.W) // Cycle when allocated, for aging. Basically, if too old, just free it.
+  val stalledIFU: Bool = Bool() // Has caused a stall
+  val retired: Bool = Bool() // Has had at least one instruction retire
 }
 
 /** FEC Tracker Performance Counters
@@ -63,7 +60,6 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
   // Output: Confirmed FEC line (miss + stall + retired)
   val fecLine = ValidIO(new Bundle {
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
-    val blkVaddr = UInt((VAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
     val triggerAddr =
       UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
@@ -79,7 +75,7 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
   val perfInfo = Output(new FECTrackerPerfInfo)
 }
 
-/** Front-End Critical (FEC) Line Tracker
+/** FEC Line Tracker
   *
   * Tracks cache lines through their lifecycle to identify FEC lines. A line is
   * FEC if it:
@@ -118,9 +114,6 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
   private val fecDetectTriggerAddr = WireInit(0.U((PAddrBits - blockOffBits).W))
 
-  private val fecBlkVaddr = RegInit(0.U((VAddrBits - blockOffBits).W))
-  private val fecDetectBlkVaddr = WireInit(0.U((VAddrBits - blockOffBits).W))
-
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
     fecDetectThisCycle := true.B
     fecDetectIdx := i.U
@@ -130,7 +123,6 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
     entry.valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
-    fecDetectBlkVaddr := entry.blkVaddr
   }
 
   // Cycle counter for aging
@@ -164,24 +156,21 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     ) {
       entries(
         hitIdx
-      ).blkPaddr := io.newMiss.bits.blkPaddr // Update block address if already tracking
-      entries(hitIdx).blkVaddr := io.newMiss.bits.blkVaddr
+      ).blkPaddr := io.newMiss.bits.blkPaddr 
       entries(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entries(
         hitIdx
-      ).allocTime := cycleCounter // Refresh allocation time on new miss for same FTQ entry
+      ).allocTime := cycleCounter // refresh allocation time on new miss for same FTQ entry 
 
     }.elsewhen(hasFreeEntry) {
       entries(freeEntryIdx).valid := true.B
       entries(freeEntryIdx).blkPaddr := io.newMiss.bits.blkPaddr
-      entries(freeEntryIdx).blkVaddr := io.newMiss.bits.blkVaddr
       entries(freeEntryIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entries(freeEntryIdx).ftqIdx := io.newMiss.bits.ftqIdx
       entries(freeEntryIdx).allocTime := cycleCounter
       entries(freeEntryIdx).stalledIFU := false.B
       entries(freeEntryIdx).retired := false.B
     }.otherwise {
-      // Tracker is full, count overflow
       perfTrackerFull := perfTrackerFull + 1.U
     }
   }
@@ -210,7 +199,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
   /** Was retired
     */
-  // Process all retirement updates (up to CommitWidth per cycle)
+  // Process all retirement updates 
   (0 until CommitWidth).foreach { w =>
     when(io.retireUpdate(w).valid) {
       entries.zipWithIndex.foreach { case (entry, i) =>
@@ -218,7 +207,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
           val wasRetired = entry.retired
           entry.retired := true.B
 
-          // Check if this is now an FEC line: miss (allocated) + stall + retired
+          // Check if this is now an FEC line: miss + stall + retired
           when(entry.stalledIFU && !wasRetired) {
             fireFEC(entry, i)
           }
@@ -235,7 +224,6 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecBlkPaddr := fecDetectBlkPaddr
     fecVSetIdx := fecDetectVSetIdx
     fecTriggerAddr := fecDetectTriggerAddr
-    fecBlkVaddr := fecDetectBlkVaddr
   }.otherwise {
     fecDetected := false.B
   }
@@ -245,7 +233,6 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.bits.blkPaddr := fecBlkPaddr
   io.fecLine.bits.vSetIdx := fecVSetIdx
   io.fecLine.bits.triggerAddr := fecTriggerAddr
-  io.fecLine.bits.blkVaddr := fecBlkVaddr
 
   /** Entry Aging & Eviction Free entries that are too old (likely stale due to
     * flush/redirect) Use the aging mechanism to automatically clean up entries
