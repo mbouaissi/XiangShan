@@ -29,7 +29,7 @@ class PDIPTableEntry(numTargets: Int)(implicit p: Parameters)
   val lru: UInt = UInt(log2Ceil(numTargets).W) // LRU for target replacement
 }
 
-/** PDIP Prefetch Target (FEC Line)
+/** PDIP Prefetch Target which is a FEC line 
   */
 class PDIPTarget(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool() // Target is valid
@@ -80,7 +80,7 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     )
   )
 
-  // Lookup logic (combinational)
+  // Lookup logic 
   private val lookupSet = table(
     io.lookup.req.bits.trigger(log2Ceil(params.numTableSets) - 1, 0)
   )
@@ -106,8 +106,8 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     VecInit(Seq.fill(params.numTargetsPerEntry)(0.U.asTypeOf(new PDIPTarget)))
   )
 
-  // ALLOC
-  when(io.allocate.valid && !io.flush) {
+  // ALLOC = fec line valid && io.enable && !io.flush
+  when(io.allocate.valid) {
     val allocSetIdx =
       io.allocate.bits.trigger(log2Ceil(params.numTableSets) - 1, 0)
     val allocSet = table(allocSetIdx)
@@ -384,7 +384,7 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   // Output
   io.prefetchVaddr <> prefetchQueue.io.deq
 
-  // Performance counters
+  // Perf counters, for bencmarking 
   private val perfTotalPrefetches = RegInit(0.U(64.W))
   private val perfTableLookups = RegInit(0.U(64.W))
   private val perfTableHits = RegInit(0.U(64.W))

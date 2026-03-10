@@ -882,25 +882,14 @@ class ICacheImp(outer: ICache)
   missUnit.io.flush := io.flush
   missUnit.io.fetch_req <> mainPipe.io.mshr.req
 
-  // Prefetch arbitration: PDIP has higher priority; IPrefetchPipe (FDIP) fills in when PDIP is idle.
-  // PDIP emits physical addresses directly (blkPaddr from its table), no TLB needed.
-  private val pdipActive = cacheParams.pdipParams.enabled.B && io.csr_pf_enable
-  private val pdipReq = pdipController.io.prefetchVaddr
-
-  // ============================================================================
   // mirror tag array: mirrors ICacheMetaArray valid+tag state for PDIP hit check.
-  // Prevents PDIP from re-requesting blocks already resident in the ICache,
-  // which would cause metaArray aliasing (multi-hit assertion in IPrefetch.scala).
-  // tagBits = PAddrBits - pgUntagBits (inherited from HasL1CacheParameters).
-  // ============================================================================
   private val mirrorTagValid = RegInit(
     VecInit.fill(ICacheSets)(VecInit.fill(ICacheWays)(false.B))
   )
   private val mirrorPhyTags = Reg(
     Vec(ICacheSets, Vec(ICacheWays, UInt(tagBits.W)))
   )
-  // Update mirror on every meta array write (refill from missUnit or ECC injection).
-  // fire = valid && ready, so this triggers exactly when the real array updates.
+  // Update on every array write
   when(metaArray.io.write.fire) {
     val wIdx = metaArray.io.write.bits.virIdx
     val wTag = metaArray.io.write.bits.phyTag
@@ -912,7 +901,7 @@ class ICacheImp(outer: ICache)
       }
     }
   }
-  // Mirror per-way flushes driven by mainPipe .
+  // Per-way flushes driven by mainPipe.
   (0 until PortNumber).foreach { i =>
     when(mainPipe.io.metaArrayFlush(i).valid) {
       val fIdx = mainPipe.io.metaArrayFlush(i).bits.virIdx
@@ -922,12 +911,14 @@ class ICacheImp(outer: ICache)
       }
     }
   }
-  // Full flush on fencei — placed after write/flush whens so it takes last-wins priority.
+  // Full flush on fencei
   when(io.fencei) {
     mirrorTagValid.foreach(x => x.foreach(y => y := false.B))
   }
-  // PDIP cache-hit gate: drop the PDIP request silently if the block is already
-  // present in the mirror cache (i.e. already has a valid tag in the meta array).
+
+  private val pdipReq = pdipController.io.prefetchVaddr
+
+  // PDIP cache-hit gate
   private val pdipPtag = getPhyTagFromBlk(pdipReq.bits.blkPaddr)
   private val pdipMirrorHit = VecInit((0 until ICacheWays).map { w =>
     mirrorTagValid(pdipReq.bits.vSetIdx)(w) && (mirrorPhyTags(
@@ -935,12 +926,12 @@ class ICacheImp(outer: ICache)
     )(w) === pdipPtag)
   }).reduce((x, y) => x || y)
 
+  private val pdipActive = cacheParams.pdipParams.enabled.B && io.csr_pf_enable
+
   missUnit.io.prefetch_req.valid := (pdipReq.valid && pdipActive && !pdipMirrorHit) ||
     prefetcher.io.MSHRReq.valid
   missUnit.io.prefetch_req.bits := Mux(
-    pdipReq.valid && pdipActive && !pdipMirrorHit,
-    // Convert PrefetchEntry to ICacheMissReq using physical address from PDIP table
-    {
+    pdipReq.valid && pdipActive && !pdipMirrorHit, {
       val r = Wire(new ICacheMissReq)
       r.blkPaddr := pdipReq.bits.blkPaddr
       r.vSetIdx := pdipReq.bits.vSetIdx
@@ -948,9 +939,10 @@ class ICacheImp(outer: ICache)
     },
     prefetcher.io.MSHRReq.bits
   )
-  // Consume PDIP request when missUnit accepts it, OR drop it immediately on a mirror hit.
+  // Consume PDIP request when missUnit accepts it or drop it on a mirror hit
   pdipReq.ready := missUnit.io.prefetch_req.ready || pdipMirrorHit
-  prefetcher.io.MSHRReq.ready := missUnit.io.prefetch_req.ready && !(pdipReq.valid && pdipActive && !pdipMirrorHit)
+  prefetcher.io.MSHRReq.ready := missUnit.io.prefetch_req.ready &&
+    !(pdipReq.valid && pdipActive && !pdipMirrorHit)
 
   // TLB ports: both used by IPrefetchPipe
   io.itlb(0) <> prefetcher.io.itlb(0)
@@ -984,9 +976,9 @@ class ICacheImp(outer: ICache)
   io.pmp(1) <> mainPipe.io.pmp(1)
 
   // FEC Tracker connections
-  fecTracker.io.newMiss <> mainPipe.io.fecNewMiss // Convert mainPipe stall info to tracker format
-  // Any valid stallI from either port indicates the FTQ entry is stalled
-  private val anyStall = mainPipe.io.fetch.stallInfo.map(_.valid).reduce(_ || _)
+  fecTracker.io.newMiss <> mainPipe.io.fecNewMiss
+  private val anyStall =
+    mainPipe.io.fetch.stallInfo.map(x => x.valid).reduce((x, y) => x || y)
   fecTracker.io.stallUpdate.valid := anyStall
   fecTracker.io.stallUpdate.bits.ftqIdx := Mux(
     mainPipe.io.fetch.stallInfo(0).valid,
@@ -994,8 +986,7 @@ class ICacheImp(outer: ICache)
     mainPipe.io.fetch.stallInfo(1).bits.ftqIdx
   )
   fecTracker.io.stallUpdate.bits.stalled := true.B
-  // Forward ROB commits for retirement tracking
-  // Convert Vec[Valid[RobCommitInfo]] to Vec[Valid[FtqPtr]]
+  // Forward ROB commits to the FECC
   (0 until CommitWidth).foreach { i =>
     fecTracker.io.retireUpdate(i).valid := io.rob_commits(i).valid
     fecTracker.io.retireUpdate(i).bits.ftqIdx := io.rob_commits(i).bits.ftqIdx
@@ -1008,11 +999,8 @@ class ICacheImp(outer: ICache)
   fecTracker.io.triggerAddr := currentFetchBlkPaddr
   fecTracker.io.flush := io.flush
 
-  // ============================================================================
-  // PDIP Controller connections - Pattern-Directed Instruction Prefetching
-  // ============================================================================
   pdipController.io.enable := cacheParams.pdipParams.enabled.B && io.csr_pf_enable
-  pdipController.io.flush := io.flush || io.fencei // often fence.i should flush prefetcher state too
+  pdipController.io.flush := io.flush || io.fencei //fencei also flushes the PDIP table
 
   // Trigger from current instruction fetch
   // PDIP learns trigger patterns from the instruction block addresses
