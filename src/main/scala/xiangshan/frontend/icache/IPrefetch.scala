@@ -33,6 +33,9 @@ class IPrefetchReq(implicit p: Parameters) extends IPrefetchBundle {
   val ftqIdx: FtqPtr = new FtqPtr
   val isSoftPrefetch: Bool = Bool()
   val backendException: UInt = UInt(ExceptionType.width.W)
+  val pdipHighCostHint: Bool = Bool()
+  val pdipControlTrigger: Bool = Bool()
+  val pdipBtbMissTrigger: Bool = Bool()
   def crossCacheline: Bool = startAddr(blockOffBits - 1) === 1.U
 
   def fromFtqICacheInfo(info: FtqICacheInfo): IPrefetchReq = {
@@ -40,6 +43,9 @@ class IPrefetchReq(implicit p: Parameters) extends IPrefetchBundle {
     this.nextlineStart := info.nextlineStart
     this.ftqIdx := info.ftqIdx
     this.isSoftPrefetch := false.B
+    this.pdipHighCostHint := info.pdipHighCostHint
+    this.pdipControlTrigger := info.pdipControlTrigger
+    this.pdipBtbMissTrigger := info.pdipBtbMissTrigger
     this
   }
 
@@ -48,6 +54,9 @@ class IPrefetchReq(implicit p: Parameters) extends IPrefetchBundle {
     this.nextlineStart := req.vaddr + (1 << blockOffBits).U
     this.ftqIdx := DontCare
     this.isSoftPrefetch := true.B
+    this.pdipHighCostHint := false.B
+    this.pdipControlTrigger := false.B
+    this.pdipBtbMissTrigger := false.B
     this
   }
 }

@@ -1005,11 +1005,20 @@ class ICacheImp(outer: ICache)
   private val ftqReqBlkPaddr = io.ftqPrefetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
   private val pdipDupWithFtqReq = pdipS1Valid && io.ftqPrefetch.req.valid &&
     (pdipS1Bits.blkPaddr === ftqReqBlkPaddr)
-  private val pdipIssueValid = pdipS1Valid && pdipActive && !pdipMirrorHit && !pdipDupWithFtqReq
+  private val pdipReqBits = Wire(new ICacheMissReq)
+  pdipReqBits.blkPaddr := pdipS1Bits.blkPaddr
+  pdipReqBits.vSetIdx := pdipS1Bits.vSetIdx
+  private val pdipDupWithFdipReq = pdipS1Valid && prefetcher.io.MSHRReq.valid &&
+    (pdipS1Bits.blkPaddr === prefetcher.io.MSHRReq.bits.blkPaddr)
+  private val pdipIssueValid = pdipS1Valid && pdipActive && !pdipMirrorHit &&
+    !pdipDupWithFtqReq && !pdipDupWithFdipReq
   private val pdipS1Consume = pdipS1Valid &&
-    (pdipMirrorHit || pdipDupWithFtqReq || !pdipActive || missUnit.io.prefetch_req.ready)
+    (pdipMirrorHit || pdipDupWithFtqReq || pdipDupWithFdipReq || !pdipActive)
   when(pdipDupWithFtqReq) {
     printf(p"[PDIP] drop duplicate with FTQ blkPaddr=0x${Hexadecimal(pdipS1Bits.blkPaddr)}\n")
+  }
+  when(pdipDupWithFdipReq) {
+    printf(p"[PDIP] drop duplicate with FDIP blkPaddr=0x${Hexadecimal(pdipS1Bits.blkPaddr)}\n")
   }
   when(pdipS1Consume) {
     pdipS1Valid := false.B
@@ -1063,22 +1072,21 @@ class ICacheImp(outer: ICache)
     waymask = mirrorWriteMask
   )
 
-  // PDIP cache-hit gate (SRAM-backed mirror)
+  // PDIP cache-hit gate (SRAM-backed mirror) and shared FDIP/PDIP arbitration.
+  // The paper keeps FDIP as the baseline prefetch source and adds PDIP alongside it,
+  // so we avoid hard-wiring PDIP priority over the FTQ-driven prefetcher here.
+  private val prefetchReqArb = Module(new RRArbiter(new ICacheMissReq, 2))
+  prefetchReqArb.io.in(0).valid := prefetcher.io.MSHRReq.valid
+  prefetchReqArb.io.in(0).bits := prefetcher.io.MSHRReq.bits
+  prefetchReqArb.io.in(1).valid := pdipIssueValid
+  prefetchReqArb.io.in(1).bits := pdipReqBits
 
-  missUnit.io.prefetch_req.valid := pdipIssueValid ||
-    prefetcher.io.MSHRReq.valid
-  missUnit.io.prefetch_req.bits := Mux(
-    pdipIssueValid, {
-      val r = Wire(new ICacheMissReq)
-      r.blkPaddr := pdipS1Bits.blkPaddr
-      r.vSetIdx := pdipS1Bits.vSetIdx
-      r
-    },
-    prefetcher.io.MSHRReq.bits
-  )
-  // Consume PDIP request when missUnit accepts it or drop it on a mirror hit
-  prefetcher.io.MSHRReq.ready := missUnit.io.prefetch_req.ready &&
-    !pdipIssueValid
+  missUnit.io.prefetch_req <> prefetchReqArb.io.out
+  prefetcher.io.MSHRReq.ready := prefetchReqArb.io.in(0).ready
+
+  when(prefetchReqArb.io.in(1).fire) {
+    pdipS1Valid := false.B
+  }
 
   // TLB ports: both used by IPrefetchPipe
   io.itlb(0) <> prefetcher.io.itlb(0)
@@ -1132,6 +1140,18 @@ class ICacheImp(outer: ICache)
     prefetcher.io.itlb(0).resp.bits.paddr(0)(PAddrBits - 1, blockOffBits),
     0.U(blockOffBits.W)
   )(PAddrBits - 1, blockOffBits)
+  private val pdipTriggerHintValid =
+    prefetcher.io.req.fire && !prefetcher.io.req.bits.isSoftPrefetch
+  private val pdipTriggerIsDemand =
+    RegEnable(!prefetcher.io.req.bits.isSoftPrefetch, false.B, prefetcher.io.req.fire)
+  private val pdipTriggerHighCostHint =
+    RegEnable(prefetcher.io.req.bits.pdipHighCostHint, false.B, pdipTriggerHintValid)
+  private val pdipTriggerControlHint =
+    RegEnable(prefetcher.io.req.bits.pdipControlTrigger, false.B, pdipTriggerHintValid)
+  private val pdipTriggerBtbMissHint =
+    RegEnable(prefetcher.io.req.bits.pdipBtbMissTrigger, false.B, pdipTriggerHintValid)
+  private val currentFetchBlkPaddrValid =
+    prefetcher.io.itlb(0).resp.valid && pdipTriggerIsDemand
   fecTracker.io.triggerAddr := currentFetchBlkPaddr
   // Only flush FEC tracker on fence.i, NOT on regular pipeline flushes
   // Regular flushes (branch mispredictions) happen ~5000 times in CoreMark
@@ -1143,14 +1163,17 @@ class ICacheImp(outer: ICache)
   pdipController.io.flush := io.fencei
 
   // Trigger from current instruction fetch
-  // PDIP learns trigger patterns from the instruction block addresses
-  pdipController.io.trigger.valid := io.ftqPrefetch.req.valid && pdipController.io.enable
-  pdipController.io.trigger.bits.blkPaddr := io.ftqPrefetch.req.bits
-    .startAddr(PAddrBits - 1, blockOffBits)
+  // PDIP uses the translated fetch block so lookup and learning share the same address domain.
+  pdipController.io.trigger.valid := currentFetchBlkPaddrValid && pdipController.io.enable
+  pdipController.io.trigger.bits.blkPaddr := currentFetchBlkPaddr
+  pdipController.io.trigger.bits.highCostHint := pdipTriggerHighCostHint
+  pdipController.io.trigger.bits.controlTrigger := pdipTriggerControlHint
+  pdipController.io.trigger.bits.btbMissTrigger := pdipTriggerBtbMissHint
 
   // Learn from FEC line detections
   // When FECTracker detects a FEC (Front-End Critical) line, PDIP learns this association
   pdipController.io.fecLine <> fecTracker.io.fecLine
+  pdipController.io.dropDupWithFtq := pdipDupWithFtqReq
 
   // MSHR availability check — use RegNext to break the combinational cycle:
   // pdipReq.valid -> prefetch_req.bits -> prefetch_req.ready -> mshrAvailable -> pdipReq.valid
