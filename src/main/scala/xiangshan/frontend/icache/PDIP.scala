@@ -13,7 +13,7 @@ case class PDIPParams(
     numTableSets: Int = 64, // Number of sets in PDIP table
     numWaysPerSet: Int = 4, // Associativity of PDIP table
     numTargetsPerEntry: Int = 4, // Max FEC targets per trigger
-    prefetchQueueSize: Int = 8, // Size of prefetch queue
+  prefetchQueueSize: Int = 40, // Size of prefetch queue (cacheline entries)
     mshrCheckEnabled: Boolean = true // Check MSHR availability before prefetch
 )
 
@@ -95,7 +95,9 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
   private val hitWay = PriorityEncoder(
     matchWay
   ) // PriorityEncoder is safe even if >1 bit set
+  private val hitWayOH = PriorityEncoderOH(matchWay)
   private val hit = matchWay =/= 0.U
+  private val hasDup = PopCount(matchWay) > 1.U
 
   // Output targets if hit
   io.lookup.resp.valid := io.lookup.req.valid && hit
@@ -105,6 +107,15 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     lookupSet(hitWay).targets,
     VecInit(Seq.fill(params.numTargetsPerEntry)(0.U.asTypeOf(new PDIPTarget)))
   )
+
+  // De-dup same trigger across multiple ways on lookup (keep one way only)
+  when(io.lookup.req.valid && hasDup && !io.allocate.valid) {
+    for (w <- 0 until params.numWaysPerSet) {
+      when(matchWay(w) && !hitWayOH(w)) {
+        lookupSet(w).valid := false.B
+      }
+    }
+  }
 
   // ALLOC = fec line valid && io.enable && !io.flush
   when(io.allocate.valid) {
@@ -124,6 +135,16 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
       val existingWay = PriorityEncoder(
         existingWayOH
       )
+      val existingWayOH1 = PriorityEncoderOH(existingWayOH)
+      val extraWays = existingWayOH & ~existingWayOH1
+
+      when(extraWays.orR) {
+        for (w <- 0 until params.numWaysPerSet) {
+          when(extraWays(w)) {
+            allocSet(w).valid := false.B
+          }
+        }
+      }
 
       // Update existing entry: add target
       val entry = allocSet(existingWay)
@@ -219,7 +240,7 @@ class PDIPTable(params: PDIPParams)(implicit p: Parameters)
     }
   }
 
-  // Flush: invalidate all entries
+  // Flush
   when(io.flush) {
     table.foreach(set => set.foreach(entry => entry.valid := false.B))
   }
@@ -282,7 +303,7 @@ class PrefetchQueue(queueSize: Int)(implicit p: Parameters)
     when(ptr_match) { fullFlag := true.B }
   }
 
-  // Dequeue (only when MSHR available)
+  // Dequeue
   io.deq.valid := !empty && io.mshrAvailable
   io.deq.bits := queue(head)
 
@@ -344,12 +365,22 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
     extends ICacheModule {
   val io: PDIPControllerIO = IO(new PDIPControllerIO(params))
 
+  // Helper for debug-friendly percentage printing without divide-by-zero.
+  private def safePercent(numerator: UInt, denominator: UInt): UInt = {
+    Mux(denominator === 0.U, 0.U, (numerator * 100.U) / denominator)
+  }
+
+  private def safeBasisPoints(numerator: UInt, denominator: UInt): UInt = {
+    Mux(denominator === 0.U, 0.U, (numerator * 10000.U) / denominator)
+  }
+
   private val pdipTable = Module(new PDIPTable(params))
   private val prefetchQueue = Module(
     new PrefetchQueue(params.prefetchQueueSize)
   )
 
   private val active = io.enable && !io.flush
+  private val activeReg = RegNext(active, false.B)
 
   pdipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
@@ -384,12 +415,36 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   // Output
   io.prefetchVaddr <> prefetchQueue.io.deq
 
+  when(active && !activeReg) {
+    printf(p"[PDIP] active enable=${io.enable} flush=${io.flush}\n")
+  }
+  when(io.prefetchVaddr.fire) {
+    printf(p"[PDIP] prefetch blkPaddr=0x${Hexadecimal(io.prefetchVaddr.bits.blkPaddr)} vSetIdx=0x${Hexadecimal(io.prefetchVaddr.bits.vSetIdx)}\n")
+  }
+  when(prefetchQueue.io.enq.valid && !prefetchQueue.io.enq.ready) {
+    printf(p"[PDIP] queue backpressure enqBlkPaddr=0x${Hexadecimal(prefetchQueue.io.enq.bits.blkPaddr)}\n")
+  }
+
   // Perf counters, for bencmarking 
   private val perfTotalPrefetches = RegInit(0.U(64.W))
   private val perfTableLookups = RegInit(0.U(64.W))
   private val perfTableHits = RegInit(0.U(64.W))
   private val perfQueueFull = RegInit(0.U(64.W))
+  private val perfTriggerReqs = RegInit(0.U(64.W))
+  private val perfLearnEvents = RegInit(0.U(64.W))
+  private val perfLookupMisses = RegInit(0.U(64.W))
+  private val perfNoConfTarget = RegInit(0.U(64.W))
+  private val perfEnqAttempts = RegInit(0.U(64.W))
+  private val perfEnqAccepted = RegInit(0.U(64.W))
+  private val perfMshrBlockedCycles = RegInit(0.U(64.W))
+  private val perfPrintInterval = 1024.U(64.W)
 
+  when(io.trigger.valid && active) {
+    perfTriggerReqs := perfTriggerReqs + 1.U
+  }
+  when(io.fecLine.valid && active) {
+    perfLearnEvents := perfLearnEvents + 1.U
+  }
   when(io.prefetchVaddr.fire) {
     perfTotalPrefetches := perfTotalPrefetches + 1.U
   }
@@ -399,8 +454,44 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   when(pdipTable.io.lookup.resp.valid) {
     perfTableHits := perfTableHits + 1.U
   }
+  when(pdipTable.io.lookup.req.valid && !pdipTable.io.lookup.resp.valid) {
+    perfLookupMisses := perfLookupMisses + 1.U
+  }
+  when(targetsValid && !hasValidTarget) {
+    perfNoConfTarget := perfNoConfTarget + 1.U
+  }
+  when(prefetchQueue.io.enq.valid) {
+    perfEnqAttempts := perfEnqAttempts + 1.U
+  }
+  when(prefetchQueue.io.enq.fire) {
+    perfEnqAccepted := perfEnqAccepted + 1.U
+  }
   when(prefetchQueue.io.enq.valid && !prefetchQueue.io.enq.ready) {
     perfQueueFull := perfQueueFull + 1.U
+  }
+  when(active && !prefetchQueue.io.empty && !io.mshrAvailable) {
+    perfMshrBlockedCycles := perfMshrBlockedCycles + 1.U
+  }
+
+  private val hitRate = safePercent(perfTableHits, perfTableLookups)
+  private val hitRateBp = safeBasisPoints(perfTableHits, perfTableLookups)
+  private val enqAcceptRate = safePercent(perfEnqAccepted, perfEnqAttempts)
+  private val enqAcceptRateBp = safeBasisPoints(perfEnqAccepted, perfEnqAttempts)
+  private val issueRate = safePercent(perfTotalPrefetches, perfEnqAccepted)
+  private val issueRateBp = safeBasisPoints(perfTotalPrefetches, perfEnqAccepted)
+  private val learnToIssueRate = safePercent(perfTotalPrefetches, perfLearnEvents)
+  private val learnToIssueRateBp = safeBasisPoints(perfTotalPrefetches, perfLearnEvents)
+
+  when(io.flush) {
+    printf(p"[PDIP] stats totalPrefetches=${perfTotalPrefetches} tableLookups=${perfTableLookups} tableHits=${perfTableHits} lookupMisses=${perfLookupMisses} hitRate=${hitRate}%(${hitRateBp}bp) queueFull=${perfQueueFull} enqAttempts=${perfEnqAttempts} enqAccepted=${perfEnqAccepted} enqAcceptRate=${enqAcceptRate}%(${enqAcceptRateBp}bp) triggerReqs=${perfTriggerReqs} learnEvents=${perfLearnEvents} noConfTarget=${perfNoConfTarget} mshrBlockedCycles=${perfMshrBlockedCycles} issueRate=${issueRate}%(${issueRateBp}bp) learnToIssueRate=${learnToIssueRate}%(${learnToIssueRateBp}bp) active=${active}\n")
+  }
+
+  private val periodicPrintFire =
+    pdipTable.io.lookup.req.valid &&
+      (((perfTableLookups + 1.U) & (perfPrintInterval - 1.U)) === 0.U)
+
+  when(periodicPrintFire) {
+    printf(p"[PDIP] stats (periodic) totalPrefetches=${perfTotalPrefetches} tableLookups=${perfTableLookups} tableHits=${perfTableHits} lookupMisses=${perfLookupMisses} hitRate=${hitRate}%(${hitRateBp}bp) enqAttempts=${perfEnqAttempts} enqAccepted=${perfEnqAccepted} enqAcceptRate=${enqAcceptRate}%(${enqAcceptRateBp}bp) queueFull=${perfQueueFull} noConfTarget=${perfNoConfTarget} mshrBlockedCycles=${perfMshrBlockedCycles}\n")
   }
 
   io.perfInfo.totalPrefetches := perfTotalPrefetches

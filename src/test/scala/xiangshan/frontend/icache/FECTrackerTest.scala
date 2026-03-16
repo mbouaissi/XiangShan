@@ -16,18 +16,15 @@ class FECTrackerTest
     with Matchers {
   behavior of "FECTracker"
 
-  // Use XiangShan's default configuration
   val defaultConfig = new DefaultConfig
   implicit val p: Parameters = defaultConfig.alterPartial({
     case XSCoreParamsKey => defaultConfig(XSTileKey).head
   })
 
-  // Use CommitWidth parameter
   val commitWidth = p(XSCoreParamsKey).CommitWidth
 
-  // Helper functions to reduce test boilerplate
   def initDUT(dut: FECTracker): Unit = {
-    dut.io.flush.poke(false.B)
+    dut.io.fencei.poke(false.B)
     dut.io.newMiss.valid.poke(false.B)
     dut.io.stallUpdate.valid.poke(false.B)
     (0 until commitWidth).foreach(i =>
@@ -89,12 +86,11 @@ class FECTrackerTest
     test(new FECTracker(numEntries = 16)) { dut =>
       initDUT(dut)
 
-      // Test Case 1: Complete FEC lifecycle (miss -> stall -> retire)
       val testFtqIdx = 10.U
       val testBlkPaddr = 0x1000.U
       val testVSetIdx = 0x10.U
 
-      // Step 1: Report a cache miss
+      // Report a cache miss
       pokeMiss(dut, testFtqIdx, testBlkPaddr, testVSetIdx)
       dut.clock.step(1)
       clearMiss(dut)
@@ -112,14 +108,14 @@ class FECTrackerTest
         fecLinesDetected = 0
       )
 
-      // Step 2: Report a stall for the same ftqIdx
-      dut.clock.step(2) // Wait a bit
+      // Report a stall for the same ftqIdx
+      dut.clock.step(2)
       pokeStall(dut, testFtqIdx, stalled = true)
       dut.clock.step(1)
       clearStall(dut)
       println(s"[Cycle 4] Stall reported for ftqIdx=${testFtqIdx}")
 
-      // FEC should still not be detected (missing retire)
+      // FEC should still not be detected
       fecDetected = dut.io.fecLine.valid.peek().litToBoolean
       println(s"[Cycle 4] FEC detected: ${fecDetected} (should be false)")
       assert(
@@ -133,8 +129,8 @@ class FECTrackerTest
         fecLinesDetected = 0
       )
 
-      // Step 3: Report retirement for the same ftqIdx
-      dut.clock.step(2) // Wait a bit
+      // Report retirement for the same ftqIdx
+      dut.clock.step(2)
       pokeRetire(dut, port = 0, testFtqIdx)
       dut.clock.step(1)
 
@@ -167,7 +163,7 @@ class FECTrackerTest
       val testBlkPaddr = 0x1000.U
       val testVSetIdx = 0x10.U
 
-      // Step 1: miss
+      // miss
       pokeMiss(dut, testFtqIdx, testBlkPaddr, testVSetIdx)
       dut.clock.step(1)
       clearMiss(dut)
@@ -180,7 +176,7 @@ class FECTrackerTest
         fecLinesDetected = 0
       )
 
-      // Step 2: retire (before stall)
+      //  retire (before stall)
       dut.clock.step(2)
       pokeRetire(dut, port = 0, testFtqIdx)
       dut.clock.step(1)
@@ -195,7 +191,7 @@ class FECTrackerTest
         fecLinesDetected = 0
       )
 
-      // Step 3: stall arrives late
+      //  stall arrives late
       dut.clock.step(2)
       pokeStall(dut, testFtqIdx, stalled = true)
       dut.clock.step(1)
@@ -222,12 +218,12 @@ class FECTrackerTest
 
       val testFtqIdx = 20.U
 
-      // Step 1: Report miss
+      // Report miss
       pokeMiss(dut, testFtqIdx, blkPaddr = 0x2000.U, vSetIdx = 0x20.U)
       dut.clock.step(1)
       clearMiss(dut)
 
-      // Step 2: Skip stall, go directly to retire
+      //  Skip stall, go directly to retire
       dut.clock.step(2)
       pokeRetire(dut, port = 0, testFtqIdx)
       dut.clock.step(1)
@@ -248,18 +244,18 @@ class FECTrackerTest
 
       val testFtqIdx = 30.U
 
-      // Step 1: Report miss
+      // Report miss
       pokeMiss(dut, testFtqIdx, blkPaddr = 0x3000.U, vSetIdx = 0x30.U)
       dut.clock.step(1)
       clearMiss(dut)
 
-      // Step 2: Report stall
+      //  Report stall
       dut.clock.step(2)
       pokeStall(dut, testFtqIdx, stalled = true)
       dut.clock.step(1)
       clearStall(dut)
 
-      // Step 3: Do NOT report retire, just check
+      //  Do NOT report retire, just check
       dut.clock.step(5)
       val fecDetected = dut.io.fecLine.valid.peek().litToBoolean
       println(
@@ -275,13 +271,13 @@ class FECTrackerTest
 
       val testFtqIdx = 40.U
 
-      // Step 1: Skip miss, go directly to stall
+      // Skip miss, go directly to stall
       dut.clock.step(2)
       pokeStall(dut, testFtqIdx, stalled = true)
       dut.clock.step(1)
       clearStall(dut)
 
-      // Step 2: Report retire
+      //  Report retire
       dut.clock.step(2)
       pokeRetire(dut, port = 0, testFtqIdx)
       dut.clock.step(1)
@@ -357,14 +353,14 @@ class FECTrackerTest
       dut.clock.step(1)
       clearMiss(dut)
 
-      // Flush
+      // Flush (fence.i)
       dut.clock.step(2)
-      dut.io.flush.poke(true.B)
+      dut.io.fencei.poke(true.B)
       dut.clock.step(1)
-      dut.io.flush.poke(false.B)
-      println(s"[Flush Test] Flush applied")
+      dut.io.fencei.poke(false.B)
+      println(s"[Flush Test] Fence.i applied")
 
-      // Try to retire - should not detect FEC after flush
+      // Try to retire, should not detect FEC after flush
       dut.clock.step(2)
       pokeStall(dut, testFtqIdx, stalled = true)
       dut.clock.step(1)
@@ -625,14 +621,14 @@ class FECTrackerTest
       clearStall(dut)
       println(s"[Stall Clear Test] Stall set to true")
 
-      // Clear stall (stalled=false) before retire
+      // Clear stall before retire
       dut.clock.step(1)
       pokeStall(dut, testFtqIdx, stalled = false)
       dut.clock.step(1)
       clearStall(dut)
       println(s"[Stall Clear Test] Stall set to false")
 
-      // Retire - should NOT detect FEC since stall was cleared
+      // Retire should NOT detect FEC since stall was cleared
       dut.clock.step(1)
       pokeRetire(dut, port = 0, testFtqIdx)
       dut.clock.step(1)
@@ -665,7 +661,7 @@ class FECTrackerTest
       // Wait past agingThreshold (1024) with margin
       dut.clock.step(1100)
 
-      // Now try to complete FEC (stall + retire) - should NOT detect because entry should be invalidated
+      // Now try to complete FEC (stall + retire)  should NOT detect because entry should be invalidated
       pokeStall(dut, ftq, stalled = true)
       dut.clock.step(1)
       clearStall(dut)
@@ -682,7 +678,7 @@ class FECTrackerTest
   it should "clear fecLine output state across flush" in {
     test(new FECTracker(numEntries = 16)) { dut =>
       // Init
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
       (0 until commitWidth).foreach(i =>
@@ -721,10 +717,10 @@ class FECTrackerTest
       dut.clock.step(1)
       dut.io.fecLine.valid.expect(false.B)
 
-      // Flush and ensure still false
-      dut.io.flush.poke(true.B)
+      // Flush (fence.i) and ensure still false
+      dut.io.fencei.poke(true.B)
       dut.clock.step(1)
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.fecLine.valid.expect(false.B)
 
       // Try to "finish" using same ftq (stall+retire) without a new miss: should not detect
@@ -748,7 +744,7 @@ class FECTrackerTest
   it should "count missesWithStall only on rising edge of stalledIFU" in {
     test(new FECTracker(numEntries = 16)) { dut =>
       // Init
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
       (0 until commitWidth).foreach(i =>
@@ -794,7 +790,7 @@ class FECTrackerTest
   it should "increment missesWithStall again if stalled is cleared then re-asserted" in {
     test(new FECTracker(numEntries = 16)) { dut =>
       // Init
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
       (0 until commitWidth).foreach(i =>
@@ -847,7 +843,7 @@ class FECTrackerTest
   it should "expose one-per-cycle behavior when two candidates become FEC in same cycle" in {
     test(new FECTracker(numEntries = 16)) { dut =>
       // Init
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
       (0 until commitWidth).foreach(i =>
@@ -863,7 +859,7 @@ class FECTrackerTest
 
       def miss(ftq: UInt, addr: UInt): Unit = {
         val addrScala: BigInt = addr.litValue
-        val vset: BigInt = (addrScala >> 6) & 0xFF  // Mask to 8 bits for vSetIdx
+        val vset: BigInt = (addrScala >> 6) & 0xff // Mask to 8 bits for vSetIdx
         dut.io.newMiss.valid.poke(true.B)
         dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
         dut.io.newMiss.bits.ftqIdx.value.poke(ftq)
@@ -922,7 +918,7 @@ class FECTrackerTest
   it should "not overflow on duplicate miss for same ftqIdx (numEntries=1)" in {
     test(new FECTracker(numEntries = 1)) { dut =>
       // Init
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
       (0 until commitWidth).foreach(i =>
@@ -972,7 +968,7 @@ class FECTrackerTest
   it should "use updated blkPaddr/vSetIdx from duplicate miss when detecting FEC" in {
     test(new FECTracker(numEntries = 4)) { dut =>
       // Init
-      dut.io.flush.poke(false.B)
+      dut.io.fencei.poke(false.B)
       dut.io.newMiss.valid.poke(false.B)
       dut.io.stallUpdate.valid.poke(false.B)
       (0 until commitWidth).foreach(i =>

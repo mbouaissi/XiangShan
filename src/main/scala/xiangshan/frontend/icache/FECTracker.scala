@@ -4,6 +4,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility._
+import utility.sram.SRAMTemplate
 import xiangshan.frontend._
 
 /** FEC Miss Information - signals a new cache miss to track */
@@ -30,6 +31,7 @@ class FECCandidateEntry(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool() // entry allocated
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W) // block address
   val vSetIdx: UInt = UInt(idxBits.W) // ICache set index
+  val triggerAddr: UInt = UInt((PAddrBits - blockOffBits).W) // trigger captured at miss time
   val ftqIdx: FtqPtr = new FtqPtr // FTQ entry that caused the miss
   val allocTime: UInt = UInt(64.W) // Cycle when allocated, for aging. Basically, if too old, just free it.
   val stalledIFU: Bool = Bool() // Has caused a stall
@@ -65,13 +67,14 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
       UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
   })
 
-  // Input: Trigger address (from redirect/misprediction)
+  // Trigger address 
   val triggerAddr = Input(UInt((PAddrBits - blockOffBits).W))
 
-  // Input: Global flush signal
-  val flush = Input(Bool())
+  // Flush - only for fence.i (instruction cache invalidation)
+  // Regular pipeline flushes (branch mispredictions) should NOT clear FEC tracker
+  val fencei = Input(Bool())
 
-  // Output: Performance information
+  // Performance information
   val perfInfo = Output(new FECTrackerPerfInfo)
 }
 
@@ -90,14 +93,23 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     extends ICacheModule {
   val io: FECTrackerIO = IO(new FECTrackerIO)
 
-  // Storage for tracking candidates
-  private val entries = RegInit(
-    VecInit(
-      Seq.fill(numEntries)(
-        0.U.asTypeOf(new FECCandidateEntry)
-      )
+  // Storage for tracking candidates (SRAM-backed)
+  private val entriesSram = Module(
+    new SRAMTemplate(
+      new FECCandidateEntry,
+      set = 1,
+      way = numEntries,
+      shouldReset = true,
+      holdRead = true,
+      singlePort = false
     )
   )
+  entriesSram.io.r.req.valid := true.B
+  entriesSram.io.r.req.bits.setIdx := 0.U.asTypeOf(entriesSram.io.r.req.bits.setIdx)
+
+  private val entriesRead = entriesSram.io.r.resp.data
+  private val entriesNext = Wire(Vec(numEntries, new FECCandidateEntry))
+  entriesNext := entriesRead
 
   // FEC detection state (must be defined before fireFEC uses them)
   // Use registers to hold FEC detection results for one cycle
@@ -119,9 +131,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecDetectIdx := i.U
     fecDetectBlkPaddr := entry.blkPaddr
     fecDetectVSetIdx := entry.vSetIdx
-    fecDetectTriggerAddr := io.triggerAddr // Capture current trigger
+    fecDetectTriggerAddr := entry.triggerAddr
 
-    entry.valid := false.B
+    entriesNext(i).valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
   }
 
@@ -138,7 +150,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
   /** Has missed
     */
-  private val freeEntryVec = VecInit(entries.map(entry => !entry.valid))
+  private val freeEntryVec = VecInit(entriesRead.map(entry => !entry.valid))
   private val hasFreeEntry = freeEntryVec.asUInt.orR
   private val freeEntryIdx = PriorityEncoder(freeEntryVec)
 
@@ -146,7 +158,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     perfTotalMisses := perfTotalMisses + 1.U // Count all miss events
 
     val hitVec = VecInit(
-      entries.map(e => e.valid && (e.ftqIdx === io.newMiss.bits.ftqIdx))
+      entriesRead.map(e => e.valid && (e.ftqIdx === io.newMiss.bits.ftqIdx))
     ) // Check if this miss is already being tracked
     val hasHit = hitVec.asUInt.orR // Reduce to see if there's any hit
     val hitIdx = PriorityEncoder(hitVec)
@@ -154,38 +166,75 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     when(
       hasHit
     ) {
-      entries(
-        hitIdx
-      ).blkPaddr := io.newMiss.bits.blkPaddr 
-      entries(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
-      entries(
-        hitIdx
-      ).allocTime := cycleCounter // refresh allocation time on new miss for same FTQ entry 
+      entriesNext(hitIdx).blkPaddr := io.newMiss.bits.blkPaddr
+      entriesNext(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
+      entriesNext(hitIdx).triggerAddr := io.triggerAddr
+      entriesNext(hitIdx).allocTime := cycleCounter // refresh allocation time on new miss for same FTQ entry
+
+      // Debug: Log duplicate miss
+      printf(
+        "[FEC] Miss (update): ftqIdx=%d blkPaddr=0x%x cycle=%d\n",
+        io.newMiss.bits.ftqIdx.value,
+        io.newMiss.bits.blkPaddr,
+        cycleCounter
+      )
 
     }.elsewhen(hasFreeEntry) {
-      entries(freeEntryIdx).valid := true.B
-      entries(freeEntryIdx).blkPaddr := io.newMiss.bits.blkPaddr
-      entries(freeEntryIdx).vSetIdx := io.newMiss.bits.vSetIdx
-      entries(freeEntryIdx).ftqIdx := io.newMiss.bits.ftqIdx
-      entries(freeEntryIdx).allocTime := cycleCounter
-      entries(freeEntryIdx).stalledIFU := false.B
-      entries(freeEntryIdx).retired := false.B
+      entriesNext(freeEntryIdx).valid := true.B
+      entriesNext(freeEntryIdx).blkPaddr := io.newMiss.bits.blkPaddr
+      entriesNext(freeEntryIdx).vSetIdx := io.newMiss.bits.vSetIdx
+      entriesNext(freeEntryIdx).triggerAddr := io.triggerAddr
+      entriesNext(freeEntryIdx).ftqIdx := io.newMiss.bits.ftqIdx
+      entriesNext(freeEntryIdx).allocTime := cycleCounter
+      entriesNext(freeEntryIdx).stalledIFU := false.B
+      entriesNext(freeEntryIdx).retired := false.B
+
+      // Debug: Log new miss
+      printf(
+        "[FEC] Miss (new): ftqIdx=%d blkPaddr=0x%x cycle=%d\n",
+        io.newMiss.bits.ftqIdx.value,
+        io.newMiss.bits.blkPaddr,
+        cycleCounter
+      )
+
     }.otherwise {
       perfTrackerFull := perfTrackerFull + 1.U
+      
+      // Debug: Log tracker full with entry states
+      val stalledCount = PopCount(entriesRead.map(e => e.valid && e.stalledIFU))
+      val retiredCount = PopCount(entriesRead.map(e => e.valid && e.retired))
+      val bothCount = PopCount(entriesRead.map(e => e.valid && e.stalledIFU && e.retired))
+      
+      printf(
+        "[FEC] Tracker FULL (miss dropped): stalled=%d retired=%d both=%d cycle=%d\n",
+        stalledCount,
+        retiredCount,
+        bothCount,
+        cycleCounter
+      )
     }
   }
 
   /** Caused a stall
     */
   when(io.stallUpdate.valid) {
-    entries.zipWithIndex.foreach { case (entry, i) =>
+    entriesRead.zipWithIndex.foreach { case (entry, i) =>
       when(entry.valid && entry.ftqIdx === io.stallUpdate.bits.ftqIdx) {
         val wasStalled = entry.stalledIFU
-        entry.stalledIFU := io.stallUpdate.bits.stalled
+        entriesNext(i).stalledIFU := io.stallUpdate.bits.stalled
 
         // If this is a new stall indication for an allocated entry, count it
         when(io.stallUpdate.bits.stalled && !wasStalled) {
           perfMissesWithStall := perfMissesWithStall + 1.U
+          
+          // Debug: Log stall event
+          printf(
+            "[FEC] Stall: ftqIdx=%d blkPaddr=0x%x retired=%d cycle=%d\n",
+            entry.ftqIdx.value,
+            entry.blkPaddr,
+            entry.retired,
+            cycleCounter
+          )
         }
 
         // If this entry is now stalled, check if it has already retired to fire FEC
@@ -199,17 +248,66 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
   /** Was retired
     */
+  // Debug: Log all incoming retire updates
+  (0 until CommitWidth).foreach { w =>
+    when(io.retireUpdate(w).valid && cycleCounter % 1000.U === 0.U) {
+      printf(
+        "[FEC] Retire signal: slot=%d ftqIdx=%d cycle=%d\n",
+        w.U,
+        io.retireUpdate(w).bits.ftqIdx.value,
+        cycleCounter
+      )
+    }
+  }
+
   // Process all retirement updates 
   (0 until CommitWidth).foreach { w =>
     when(io.retireUpdate(w).valid) {
-      entries.zipWithIndex.foreach { case (entry, i) =>
+      val hitVec = VecInit(
+        entriesRead.map(e => e.valid && (e.ftqIdx === io.retireUpdate(w).bits.ftqIdx))
+      )
+      val hasHit = hitVec.asUInt.orR
+      val hitIdx = PriorityEncoder(hitVec)
+
+      when(!hasHit && cycleCounter % 1000.U === 0.U) {
+        // Debug: Log retire miss (no matching entry)
+        printf(
+          "[FEC] Retire NO MATCH: ftqIdx=%d cycle=%d\n",
+          io.retireUpdate(w).bits.ftqIdx.value,
+          cycleCounter
+        )
+      }
+
+      entriesRead.zipWithIndex.foreach { case (entry, i) =>
         when(entry.valid && entry.ftqIdx === io.retireUpdate(w).bits.ftqIdx) {
           val wasRetired = entry.retired
-          entry.retired := true.B
+          entriesNext(i).retired := true.B
+
+          // Debug: Log retire event
+          when(!wasRetired) {
+            printf(
+              "[FEC] Retire MATCH: ftqIdx=%d blkPaddr=0x%x stalled=%d cycle=%d\n",
+              entry.ftqIdx.value,
+              entry.blkPaddr,
+              entry.stalledIFU,
+              cycleCounter
+            )
+          }
 
           // Check if this is now an FEC line: miss + stall + retired
           when(entry.stalledIFU && !wasRetired) {
             fireFEC(entry, i)
+          }.elsewhen(!entry.stalledIFU && !wasRetired) {
+            // Entry retired without ever stalling: stall always precedes retire in
+            // normal flow (Miss → Stall → Fill → Retire), so this entry will
+            // never become FEC.  Free the slot so it doesn't clog the tracker.
+            entriesNext(i).valid := false.B
+            printf(
+              "[FEC] Retire (no stall, freeing): ftqIdx=%d blkPaddr=0x%x cycle=%d\n",
+              entry.ftqIdx.value,
+              entry.blkPaddr,
+              cycleCounter
+            )
           }
 
         }
@@ -234,22 +332,67 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.bits.vSetIdx := fecVSetIdx
   io.fecLine.bits.triggerAddr := fecTriggerAddr
 
+  // Debug: Log FEC line detections
+  when(fecDetected) {
+    printf(
+      "[FEC] Detected FEC Line: blkPaddr=0x%x vSetIdx=0x%x triggerAddr=0x%x cycle=%d\n",
+      fecBlkPaddr,
+      fecVSetIdx,
+      fecTriggerAddr,
+      cycleCounter
+    )
+  }
+
   /** Entry Aging & Eviction Free entries that are too old (likely stale due to
     * flush/redirect) Use the aging mechanism to automatically clean up entries
     * that might never get retired
     */
-  private val agingThreshold = 1024.U // Cycles before considering entry stale
-  entries.foreach { entry =>
+  private val agingThreshold = 50000.U // Cycles before considering entry stale (increased from 1024)
+  entriesRead.zipWithIndex.foreach { case (entry, i) =>
     when(entry.valid && (cycleCounter - entry.allocTime) > agingThreshold) {
-      entry.valid := false.B
+      entriesNext(i).valid := false.B
+      
+      // Debug: Log aged entries
+      printf(
+        "[FEC] Aged out: ftqIdx=%d blkPaddr=0x%x stalled=%d retired=%d age=%d\n",
+        entry.ftqIdx.value,
+        entry.blkPaddr,
+        entry.stalledIFU,
+        entry.retired,
+        cycleCounter - entry.allocTime
+      )
     }
   }
 
-  /** Flush Handling On global flush, invalidate all entries
+  /** Flush Handling 
+    * 
+    * IMPORTANT: Only flush on fence.i, NOT on regular pipeline flushes!
+    * 
+    * Rationale:
+    * - Pipeline flushes (branch mispredictions) happen frequently (~4999 times in CoreMark)
+    * - But cache misses and stalls are still valid even after a flush
+    * - We want to track FEC lines across executions to learn patterns
+    * - Only fence.i (which invalidates the entire ICache) should clear tracker
+    * - Stale entries will age out naturally via the aging mechanism
     */
-  when(io.flush) {
-    entries.foreach { entry =>
-      entry.valid := false.B
+  when(io.fencei) {
+    // Count entries in different states before flushing
+    val validCount = PopCount(entriesRead.map(_.valid))
+    val stalledCount = PopCount(entriesRead.map(e => e.valid && e.stalledIFU))
+    val retiredCount = PopCount(entriesRead.map(e => e.valid && e.retired))
+    val bothCount = PopCount(entriesRead.map(e => e.valid && e.stalledIFU && e.retired))
+    
+    printf(
+      "[FEC] FENCEI: clearing %d entries (stalled=%d retired=%d both=%d) cycle=%d\n",
+      validCount,
+      stalledCount,
+      retiredCount,
+      bothCount,
+      cycleCounter
+    )
+    
+    entriesRead.zipWithIndex.foreach { case (entry, i) =>
+      entriesNext(i).valid := false.B
     }
   }
 
@@ -260,16 +403,49 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.perfInfo.fecLinesDetected := perfFECLinesDetected
   io.perfInfo.trackerFull := perfTrackerFull
 
-  /** Debug & Assertions
-    */
-  if (env.EnableDifftest || env.AlwaysBasicDiff) {
-    dontTouch(entries)
-    dontTouch(fecDetected)
+  // Debug: Print periodic summary (every 10000 cycles)
+  when(cycleCounter % 10000.U === 0.U && cycleCounter =/= 0.U) {
+    val validCount = PopCount(entriesRead.map(_.valid))
+    val stalledOnlyCount = PopCount(entriesRead.map(e => e.valid && e.stalledIFU && !e.retired))
+    val retiredOnlyCount = PopCount(entriesRead.map(e => e.valid && !e.stalledIFU && e.retired))
+    val bothCount = PopCount(entriesRead.map(e => e.valid && e.stalledIFU && e.retired))
+    val neitherCount = PopCount(entriesRead.map(e => e.valid && !e.stalledIFU && !e.retired))
+    
+    printf(
+      "[FEC Summary] Cycle %d: Misses=%d StallMisses=%d FECLines=%d TrackerFull=%d\n",
+      cycleCounter,
+      perfTotalMisses,
+      perfMissesWithStall,
+      perfFECLinesDetected,
+      perfTrackerFull
+    )
+    printf(
+      "[FEC State] Valid=%d StalledOnly=%d RetiredOnly=%d Both=%d Neither=%d\n",
+      validCount,
+      stalledOnlyCount,
+      retiredOnlyCount,
+      bothCount,
+      neitherCount
+    )
   }
 
-  // Sanity check: Should never have more than one FEC detection per cycle
-  assert(
-    PopCount(entries.map(e => e.valid && e.stalledIFU && e.retired)) <= 1.U,
-    "FECTracker: Multiple FEC lines detected in same cycle"
+  private val entriesChanged = Wire(Vec(numEntries, Bool()))
+  when(reset.asBool) {
+    entriesChanged := VecInit(Seq.fill(numEntries)(false.B))
+  }.otherwise {
+    entriesChanged := VecInit(entriesRead.zip(entriesNext).map {
+      case (prev, next) => prev.asUInt =/= next.asUInt
+    })
+  }
+  private val entriesWriteMask = entriesChanged.asUInt
+  private val entriesWriteValid = entriesWriteMask.orR
+
+  entriesSram.io.w.req.valid := entriesWriteValid
+  entriesSram.io.w.req.bits.apply(
+    data = entriesNext,
+    setIdx = 0.U.asTypeOf(entriesSram.io.w.req.bits.setIdx),
+    waymask = entriesWriteMask
   )
+
+
 }

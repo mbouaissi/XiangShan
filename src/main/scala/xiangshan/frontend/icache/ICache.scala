@@ -325,6 +325,7 @@ class ICacheMetaArray(implicit p: Parameters)
     poison = io.write.bits.poison
   )
 
+
   private val tagArrays = (0 until PortNumber) map { bank =>
     val tagArray = Module(
       new SplittedSRAMTemplate(
@@ -742,7 +743,7 @@ class ICacheImp(outer: ICache)
   private val replacer = Module(new ICacheReplacer)
   private val prefetcher = Module(new IPrefetchPipe)
   private val wayLookup = Module(new WayLookup)
-  private val fecTracker = Module(new FECTracker(numEntries = 16))
+  private val fecTracker = Module(new FECTracker(numEntries = 32))  // Increased from 16 to reduce "tracker full" events
   private val pdipController = Module(
     new PDIPController(cacheParams.pdipParams)
   )
@@ -759,6 +760,13 @@ class ICacheImp(outer: ICache)
   private val ecc_enable =
     if (outer.ctrlUnitOpt.nonEmpty) outer.ctrlUnitOpt.get.module.io.ecc_enable
     else true.B
+
+  // Miss write buffer with tag de-dup for prefetch fills (used when no ctrlUnit)
+  private val missWriteBufValid = RegInit(false.B)
+  private val missWriteBufNeedDedup = RegInit(false.B)
+  private val missMetaBuf = Reg(new ICacheMetaWriteBundle)
+  private val missDataBuf = Reg(new ICacheDataWriteBundle)
+  private val missWaymaskBuf = RegInit(0.U(nWays.W))
 
   // dataArray io
   if (outer.ctrlUnitOpt.nonEmpty) {
@@ -791,17 +799,31 @@ class ICacheImp(outer: ICache)
       dataArray.io.write.ready
     )
   } else {
+    val missWriteInFire = missUnit.io.meta_write.valid && missUnit.io.data_write.valid && !missWriteBufValid
+    when(missWriteInFire) {
+      missMetaBuf := missUnit.io.meta_write.bits
+      missDataBuf := missUnit.io.data_write.bits
+      missWaymaskBuf := missUnit.io.meta_write.bits.waymask
+      missWriteBufValid := true.B
+      missWriteBufNeedDedup := true.B
+    }
+
+    missUnit.io.meta_write.ready := !missWriteBufValid
+    missUnit.io.data_write.ready := !missWriteBufValid
+
     // Use signal-level assignments instead of <> to maintain consistency
-    dataArray.io.write.valid := missUnit.io.data_write.valid
-    dataArray.io.write.bits := missUnit.io.data_write.bits
-    missUnit.io.data_write.ready := dataArray.io.write.ready
+    dataArray.io.write.valid := missWriteBufValid && !missWriteBufNeedDedup
+    dataArray.io.write.bits := missDataBuf
+    dataArray.io.write.bits.waymask := missWaymaskBuf
   }
   dataArray.io.read <> mainPipe.io.dataArray.toIData
   mainPipe.io.dataArray.fromIData := dataArray.io.readResp
 
   // metaArray io
   metaArray.io.flushAll := io.fencei
-  metaArray.io.flush <> mainPipe.io.metaArrayFlush
+  val metaArrayFlush = Wire(Vec(PortNumber, ValidIO(new ICacheMetaFlushBundle)))
+  metaArrayFlush := mainPipe.io.metaArrayFlush
+  metaArray.io.flush <> metaArrayFlush
 
   // metaArray read path (IPrefetchPipe reads meta; ctrlUnit overrides when injecting)
   if (outer.ctrlUnitOpt.nonEmpty) {
@@ -843,8 +865,10 @@ class ICacheImp(outer: ICache)
     }
     ctrlUnit.io.metaReadResp := metaArray.io.readResp
   } else {
-    metaArray.io.write <> missUnit.io.meta_write
     metaArray.io.read <> prefetcher.io.metaRead.toIMeta
+    metaArray.io.write.valid := missWriteBufValid && !missWriteBufNeedDedup
+    metaArray.io.write.bits := missMetaBuf
+    metaArray.io.write.bits.waymask := missWaymaskBuf
   }
   prefetcher.io.metaRead.fromIMeta := metaArray.io.readResp
 
@@ -881,68 +905,180 @@ class ICacheImp(outer: ICache)
   missUnit.io.fencei := io.fencei
   missUnit.io.flush := io.flush
   missUnit.io.fetch_req <> mainPipe.io.mshr.req
-
-  // mirror tag array: mirrors ICacheMetaArray valid+tag state for PDIP hit check.
-  private val mirrorTagValid = RegInit(
-    VecInit.fill(ICacheSets)(VecInit.fill(ICacheWays)(false.B))
-  )
-  private val mirrorPhyTags = Reg(
-    Vec(ICacheSets, Vec(ICacheWays, UInt(tagBits.W)))
-  )
-  // Update on every array write
-  when(metaArray.io.write.fire) {
-    val wIdx = metaArray.io.write.bits.virIdx
-    val wTag = metaArray.io.write.bits.phyTag
-    val wMask = metaArray.io.write.bits.waymask.asBools
-    (0 until ICacheWays).foreach { w =>
-      when(wMask(w)) {
-        mirrorTagValid(wIdx)(w) := !metaArray.io.write.bits.poison
-        mirrorPhyTags(wIdx)(w) := wTag
-      }
-    }
+  // Shadow SRAM: mirror tag array for PDIP hit check.
+  private val mirrorTagGen = new Bundle {
+    val valid: Bool = Bool()
+    val tag: UInt = UInt(tagBits.W)
+    val epoch: Bool = Bool()
   }
-  // Per-way flushes driven by mainPipe.
-  (0 until PortNumber).foreach { i =>
-    when(mainPipe.io.metaArrayFlush(i).valid) {
-      val fIdx = mainPipe.io.metaArrayFlush(i).bits.virIdx
-      val fMask = mainPipe.io.metaArrayFlush(i).bits.waymask.asBools
-      (0 until ICacheWays).foreach { w =>
-        when(fMask(w)) { mirrorTagValid(fIdx)(w) := false.B }
-      }
-    }
-  }
-  // Full flush on fencei
+  private val mirrorEpoch = RegInit(false.B)
   when(io.fencei) {
-    mirrorTagValid.foreach(x => x.foreach(y => y := false.B))
+    mirrorEpoch := ~mirrorEpoch
   }
 
-  private val pdipReq = pdipController.io.prefetchVaddr
+  private val mirrorTagArray = Module(
+    new SRAMTemplate(
+      mirrorTagGen,
+      set = ICacheSets,
+      way = ICacheWays,
+      shouldReset = true,
+      holdRead = true,
+      singlePort = false
+    )
+  )
 
-  // PDIP cache-hit gate
-  private val pdipPtag = getPhyTagFromBlk(pdipReq.bits.blkPaddr)
-  private val pdipMirrorHit = VecInit((0 until ICacheWays).map { w =>
-    mirrorTagValid(pdipReq.bits.vSetIdx)(w) && (mirrorPhyTags(
-      pdipReq.bits.vSetIdx
-    )(w) === pdipPtag)
+  // One-entry PDIP mirror lookup pipeline (SRAM read latency = 1)
+  private val pdipReq = pdipController.io.prefetchVaddr
+  private val pdipS0Pending = RegInit(false.B)
+  private val pdipS0Fire = pdipReq.valid && pdipReq.ready
+  when(pdipS0Fire) {
+    pdipS0Pending := true.B
+  }
+
+  private val pdipS1Valid = RegInit(false.B)
+  private val pdipS1Bits = Reg(new PrefetchEntry)
+  private val pdipS1Hit = RegInit(false.B)
+
+  private val pdipS1En = RegNext(pdipS0Fire, false.B)
+  when(pdipS1En) {
+    pdipS0Pending := false.B
+  }
+
+  val missDedupReq = missWriteBufValid && missWriteBufNeedDedup
+
+  // Accept PDIP request only when no lookup is pending and stage1 is empty
+  pdipReq.ready := !pdipS0Pending && !pdipS1Valid && !missDedupReq
+
+  // SRAM read for PDIP mirror hit or miss-write de-dup
+  mirrorTagArray.io.r.req.valid := missDedupReq || pdipS0Fire
+  mirrorTagArray.io.r.req.bits.setIdx := Mux(
+    missDedupReq,
+    missMetaBuf.virIdx.asTypeOf(mirrorTagArray.io.r.req.bits.setIdx),
+    pdipReq.bits.vSetIdx
+  )
+  val pdipS0BitsReg = RegEnable(pdipReq.bits, pdipS0Fire)
+
+  private val pdipS1HitCalc = VecInit((0 until ICacheWays).map { w =>
+    val entry = mirrorTagArray.io.r.resp.data(w)
+    entry.valid && (entry.epoch === mirrorEpoch) &&
+      (entry.tag === getPhyTagFromBlk(pdipS0BitsReg.blkPaddr))
   }).reduce((x, y) => x || y)
 
-  private val pdipActive = cacheParams.pdipParams.enabled.B && io.csr_pf_enable
+  when(pdipS1En) {
+    pdipS1Valid := true.B
+    pdipS1Bits := pdipS0BitsReg
+    pdipS1Hit := pdipS1HitCalc
+  }
 
-  missUnit.io.prefetch_req.valid := (pdipReq.valid && pdipActive && !pdipMirrorHit) ||
+  // De-dup miss writes: if the tag already exists in the set, reuse that way
+  private val missDedupResp = RegNext(missDedupReq, false.B)
+  private val dedupFlushValid = WireInit(false.B)
+  private val dedupFlushBits = Wire(new ICacheMetaFlushBundle)
+  dedupFlushBits := 0.U.asTypeOf(new ICacheMetaFlushBundle)
+  when(missDedupResp) {
+    val matchWays = VecInit((0 until ICacheWays).map { w =>
+      val entry = mirrorTagArray.io.r.resp.data(w)
+      entry.valid && (entry.epoch === mirrorEpoch) && (entry.tag === missMetaBuf.phyTag)
+    }).asUInt
+    val matchWayOneHot = PriorityEncoderOH(matchWays)
+    val extraWays = matchWays & ~matchWayOneHot
+    missWaymaskBuf := Mux(matchWays.orR, matchWayOneHot, missMetaBuf.waymask)
+    when(extraWays.orR) {
+      dedupFlushValid := true.B
+      dedupFlushBits.virIdx := missMetaBuf.virIdx
+      dedupFlushBits.waymask := extraWays
+    }
+    missWriteBufNeedDedup := false.B
+  }
+
+  when(missWriteBufValid && !missWriteBufNeedDedup) {
+    missWriteBufValid := false.B
+  }
+
+  when(dedupFlushValid && !mainPipe.io.metaArrayFlush(0).valid) {
+    metaArrayFlush(0).valid := true.B
+    metaArrayFlush(0).bits := dedupFlushBits
+  }
+
+  private val pdipActive = cacheParams.pdipParams.enabled.B && io.csr_pf_enable
+  private val pdipMirrorHit = pdipS1Valid && pdipS1Hit
+  private val ftqReqBlkPaddr = io.ftqPrefetch.req.bits.startAddr(PAddrBits - 1, blockOffBits)
+  private val pdipDupWithFtqReq = pdipS1Valid && io.ftqPrefetch.req.valid &&
+    (pdipS1Bits.blkPaddr === ftqReqBlkPaddr)
+  private val pdipIssueValid = pdipS1Valid && pdipActive && !pdipMirrorHit && !pdipDupWithFtqReq
+  private val pdipS1Consume = pdipS1Valid &&
+    (pdipMirrorHit || pdipDupWithFtqReq || !pdipActive || missUnit.io.prefetch_req.ready)
+  when(pdipDupWithFtqReq) {
+    printf(p"[PDIP] drop duplicate with FTQ blkPaddr=0x${Hexadecimal(pdipS1Bits.blkPaddr)}\n")
+  }
+  when(pdipS1Consume) {
+    pdipS1Valid := false.B
+  }
+
+  // Mirror tag SRAM write (single write port, priority: flush > meta write)
+  val flushValids = Wire(Vec(PortNumber, Bool()))
+  val flushIdxs = Wire(Vec(PortNumber, UInt(log2Ceil(ICacheSets).W)))
+  val flushMasks = Wire(Vec(PortNumber, UInt(ICacheWays.W)))
+  (0 until PortNumber).foreach { i =>
+    flushValids(i) := mainPipe.io.metaArrayFlush(i).valid
+    flushIdxs(i) := mainPipe.io.metaArrayFlush(i).bits.virIdx
+    flushMasks(i) := mainPipe.io.metaArrayFlush(i).bits.waymask
+  }
+
+  val hasFlush = flushValids.asUInt.orR
+  val flushOH = PriorityEncoderOH(flushValids)
+  val flushIdxSel = Mux1H(flushOH, flushIdxs)
+  val flushMaskSel = Mux1H(flushOH, flushMasks)
+
+  val metaWriteValid = metaArray.io.write.fire
+  val metaWriteIdx = metaArray.io.write.bits.virIdx
+  val metaWriteMask = metaArray.io.write.bits.waymask
+  val metaWriteTag = metaArray.io.write.bits.phyTag
+  val metaWriteValidBit = !metaArray.io.write.bits.poison
+
+  val mirrorWriteValid = hasFlush || metaWriteValid
+  val mirrorWriteIdx = Mux(hasFlush, flushIdxSel, metaWriteIdx)
+  val mirrorWriteMask = Mux(hasFlush, flushMaskSel, metaWriteMask)
+  val mirrorWriteData = WireInit(
+    VecInit(Seq.fill(ICacheWays)(0.U.asTypeOf(mirrorTagGen)))
+  )
+  when(hasFlush) {
+    (0 until ICacheWays).foreach { w =>
+      mirrorWriteData(w).valid := false.B
+      mirrorWriteData(w).tag := 0.U
+      mirrorWriteData(w).epoch := mirrorEpoch
+    }
+  }.elsewhen(metaWriteValid) {
+    (0 until ICacheWays).foreach { w =>
+      mirrorWriteData(w).valid := metaWriteValidBit
+      mirrorWriteData(w).tag := metaWriteTag
+      mirrorWriteData(w).epoch := mirrorEpoch
+    }
+  }
+
+  mirrorTagArray.io.w.req.valid := mirrorWriteValid
+  mirrorTagArray.io.w.req.bits.apply(
+    data = mirrorWriteData,
+    setIdx = mirrorWriteIdx,
+    waymask = mirrorWriteMask
+  )
+
+  // PDIP cache-hit gate (SRAM-backed mirror)
+
+  missUnit.io.prefetch_req.valid := pdipIssueValid ||
     prefetcher.io.MSHRReq.valid
   missUnit.io.prefetch_req.bits := Mux(
-    pdipReq.valid && pdipActive && !pdipMirrorHit, {
+    pdipIssueValid, {
       val r = Wire(new ICacheMissReq)
-      r.blkPaddr := pdipReq.bits.blkPaddr
-      r.vSetIdx := pdipReq.bits.vSetIdx
+      r.blkPaddr := pdipS1Bits.blkPaddr
+      r.vSetIdx := pdipS1Bits.vSetIdx
       r
     },
     prefetcher.io.MSHRReq.bits
   )
   // Consume PDIP request when missUnit accepts it or drop it on a mirror hit
-  pdipReq.ready := missUnit.io.prefetch_req.ready || pdipMirrorHit
   prefetcher.io.MSHRReq.ready := missUnit.io.prefetch_req.ready &&
-    !(pdipReq.valid && pdipActive && !pdipMirrorHit)
+    !pdipIssueValid
 
   // TLB ports: both used by IPrefetchPipe
   io.itlb(0) <> prefetcher.io.itlb(0)
@@ -997,10 +1133,14 @@ class ICacheImp(outer: ICache)
     0.U(blockOffBits.W)
   )(PAddrBits - 1, blockOffBits)
   fecTracker.io.triggerAddr := currentFetchBlkPaddr
-  fecTracker.io.flush := io.flush
+  // Only flush FEC tracker on fence.i, NOT on regular pipeline flushes
+  // Regular flushes (branch mispredictions) happen ~5000 times in CoreMark
+  // but FEC tracking should survive across flushes to learn patterns
+  fecTracker.io.fencei := io.fencei
 
   pdipController.io.enable := cacheParams.pdipParams.enabled.B && io.csr_pf_enable
-  pdipController.io.flush := io.flush || io.fencei //fencei also flushes the PDIP table
+  // Keep PDIP learning across regular pipeline flushes; only fence.i should clear it.
+  pdipController.io.flush := io.fencei
 
   // Trigger from current instruction fetch
   // PDIP learns trigger patterns from the instruction block addresses

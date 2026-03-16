@@ -330,6 +330,12 @@ class IPrefetchPipe(implicit p: Parameters)
     waymasks
   }
 
+  private def normalizeWaymask(mask: UInt): UInt = {
+    val oh = PriorityEncoderOH(mask)
+    val multi = (mask & ~oh).orR
+    Mux(multi, oh, mask)
+  }
+
   private val s1_SRAM_waymasks = VecInit((0 until PortNumber).map { port =>
     Mux(
       tlb_valid_pulse(port),
@@ -352,7 +358,7 @@ class IPrefetchPipe(implicit p: Parameters)
    * 4. hit -> hit / miss -> miss: ECC failure happens in an irrelevant way, so we don't care about it this time.
    */
   private val s1_SRAM_meta_codes = VecInit((0 until PortNumber).map { port =>
-    Mux1H(s1_SRAM_waymasks(port), fromMeta.codes(port))
+    Mux1H(normalizeWaymask(s1_SRAM_waymasks(port)), fromMeta.codes(port))
   })
 
   /** update waymasks and meta_codes according to MSHR update data
@@ -364,8 +370,10 @@ class IPrefetchPipe(implicit p: Parameters)
       code: UInt
   ): (UInt, UInt) = {
     require(mask.getWidth == nWays)
-    val new_mask = WireInit(mask)
-    val new_code = WireInit(code)
+    val new_mask = Wire(UInt(nWays.W))
+    val new_code = Wire(UInt(ICacheMetaCodeBits.W))
+    new_mask := mask
+    new_code := code
     val valid = fromMSHR.valid && !fromMSHR.bits.corrupt
     val vset_same = fromMSHR.bits.vSetIdx === vSetIdx
     val ptag_same = getPhyTagFromBlk(fromMSHR.bits.blkPaddr) === ptag
@@ -406,17 +414,20 @@ class IPrefetchPipe(implicit p: Parameters)
   // update waymasks and meta_codes
   (0 until PortNumber).foreach { i =>
     val old_waymask = Mux(s1_SRAM_valid, s1_SRAM_waymasks(i), s1_waymasks_r(i))
+    val old_waymask_norm = normalizeWaymask(old_waymask)
     val old_meta_codes =
       Mux(s1_SRAM_valid, s1_SRAM_meta_codes(i), s1_meta_codes_r(i))
     val new_info = updateMetaInfo(
-      old_waymask,
+      old_waymask_norm,
       s1_req_vSetIdx(i),
       s1_req_ptags(i),
       old_meta_codes
     )
-    s1_waymasks(i) := new_info._1
+    s1_waymasks(i) := normalizeWaymask(new_info._1)
     s1_meta_codes(i) := new_info._2
   }
+
+  private val s1_waymasks_forced = s1_waymasks
 
   /** send enqueue req to WayLookup
     * **********************************************************************
@@ -425,7 +436,7 @@ class IPrefetchPipe(implicit p: Parameters)
   toWayLookup.valid := ((state === m_enqWay) || ((state === m_idle) && itlb_finish)) &&
     !s1_flush && !fromMSHR.valid && !s1_isSoftPrefetch // do not enqueue soft prefetch
   toWayLookup.bits.vSetIdx := s1_req_vSetIdx
-  toWayLookup.bits.waymask := s1_waymasks
+  toWayLookup.bits.waymask := s1_waymasks_forced
   toWayLookup.bits.ptag := s1_req_ptags
   toWayLookup.bits.gpaddr := s1_req_gpaddr
   toWayLookup.bits.isForVSnonLeafPTE := s1_req_isForVSnonLeafPTE
@@ -443,7 +454,7 @@ class IPrefetchPipe(implicit p: Parameters)
     toWayLookup.bits.itlb_pbmt(i) := Mux(excpValid, s1_itlb_pbmt(i), Pbmt.pma)
   }
 
-  private val s1_waymasks_vec = s1_waymasks.map(_.asTypeOf(Vec(nWays, Bool())))
+  private val s1_waymasks_vec = s1_waymasks_forced.map(_.asTypeOf(Vec(nWays, Bool())))
   when(toWayLookup.fire) {
     assert(
       PopCount(s1_waymasks_vec(0)) <= 1.U && (PopCount(
