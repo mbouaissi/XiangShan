@@ -36,6 +36,7 @@ class FECCandidateEntry(implicit p: Parameters) extends ICacheBundle {
   val allocTime: UInt = UInt(64.W) // Cycle when allocated, for aging. Basically, if too old, just free it.
   val stalledIFU: Bool = Bool() // Has caused a stall
   val retired: Bool = Bool() // Has had at least one instruction retire
+  val stallCycles: UInt = UInt(4.W) // Saturating count of starvation cycles
 }
 
 /** FEC Tracker Performance Counters
@@ -65,6 +66,7 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
     val vSetIdx = UInt(idxBits.W)
     val triggerAddr =
       UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
+    val highCost = Bool() // Decode starvation lasted at least 10 cycles
   })
 
   // Trigger address 
@@ -118,6 +120,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecBlkPaddr = RegInit(0.U((PAddrBits - blockOffBits).W))
   private val fecVSetIdx = RegInit(0.U(idxBits.W))
   private val fecTriggerAddr = RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val fecHighCost = RegInit(false.B)
 
   // Wire to indicate if FEC is being detected this cycle
   private val fecDetectThisCycle = WireInit(false.B)
@@ -125,6 +128,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecDetectBlkPaddr = WireInit(0.U((PAddrBits - blockOffBits).W))
   private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
   private val fecDetectTriggerAddr = WireInit(0.U((PAddrBits - blockOffBits).W))
+  private val fecDetectHighCost = WireInit(false.B)
 
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
     fecDetectThisCycle := true.B
@@ -132,6 +136,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecDetectBlkPaddr := entry.blkPaddr
     fecDetectVSetIdx := entry.vSetIdx
     fecDetectTriggerAddr := entry.triggerAddr
+    fecDetectHighCost := entry.stallCycles >= 10.U
 
     entriesNext(i).valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
@@ -170,6 +175,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       entriesNext(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entriesNext(hitIdx).triggerAddr := io.triggerAddr
       entriesNext(hitIdx).allocTime := cycleCounter // refresh allocation time on new miss for same FTQ entry
+      entriesNext(hitIdx).stallCycles := 0.U
 
       // Debug: Log duplicate miss
       printf(
@@ -188,6 +194,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       entriesNext(freeEntryIdx).allocTime := cycleCounter
       entriesNext(freeEntryIdx).stalledIFU := false.B
       entriesNext(freeEntryIdx).retired := false.B
+      entriesNext(freeEntryIdx).stallCycles := 0.U
 
       // Debug: Log new miss
       printf(
@@ -222,6 +229,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       when(entry.valid && entry.ftqIdx === io.stallUpdate.bits.ftqIdx) {
         val wasStalled = entry.stalledIFU
         entriesNext(i).stalledIFU := io.stallUpdate.bits.stalled
+        when(io.stallUpdate.bits.stalled && entry.stallCycles =/= 15.U) {
+          entriesNext(i).stallCycles := entry.stallCycles + 1.U
+        }
 
         // If this is a new stall indication for an allocated entry, count it
         when(io.stallUpdate.bits.stalled && !wasStalled) {
@@ -322,6 +332,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecBlkPaddr := fecDetectBlkPaddr
     fecVSetIdx := fecDetectVSetIdx
     fecTriggerAddr := fecDetectTriggerAddr
+    fecHighCost := fecDetectHighCost
   }.otherwise {
     fecDetected := false.B
   }
@@ -331,14 +342,16 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.bits.blkPaddr := fecBlkPaddr
   io.fecLine.bits.vSetIdx := fecVSetIdx
   io.fecLine.bits.triggerAddr := fecTriggerAddr
+  io.fecLine.bits.highCost := fecHighCost
 
   // Debug: Log FEC line detections
   when(fecDetected) {
     printf(
-      "[FEC] Detected FEC Line: blkPaddr=0x%x vSetIdx=0x%x triggerAddr=0x%x cycle=%d\n",
+      "[FEC] Detected FEC Line: blkPaddr=0x%x vSetIdx=0x%x triggerAddr=0x%x highCost=%d cycle=%d\n",
       fecBlkPaddr,
       fecVSetIdx,
       fecTriggerAddr,
+      fecHighCost,
       cycleCounter
     )
   }

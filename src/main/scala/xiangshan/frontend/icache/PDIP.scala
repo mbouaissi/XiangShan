@@ -412,6 +412,7 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
     val vSetIdx = UInt(idxBits.W)
     val triggerAddr =
       UInt((PAddrBits - blockOffBits).W) // Trigger that caused this FEC
+    val highCost = Bool()
   }))
 
   // Output: Prefetch request to ICache
@@ -500,12 +501,13 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
     randomValue === 0.U
   }
 
-  private val learnEligible =
-    io.fecLine.valid &&
-      active &&
+  private val fecLearnSeen = io.fecLine.valid && active
+  private val highPriorityLearn =
+    fecLearnSeen &&
       learnedMetaHit &&
-      learnedTriggerMeta.highCost &&
-      probabilityPass
+      io.fecLine.bits.highCost
+  private val learnEligible =
+    highPriorityLearn || (fecLearnSeen && probabilityPass)
 
   pdipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
@@ -594,20 +596,40 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   private val perfTableHits = RegInit(0.U(64.W))
   private val perfQueueFull = RegInit(0.U(64.W))
   private val perfTriggerReqs = RegInit(0.U(64.W))
+  private val perfFecLineSeen = RegInit(0.U(64.W))
   private val perfLearnEvents = RegInit(0.U(64.W))
+  private val perfPreferredLearnEvents = RegInit(0.U(64.W))
   private val perfLookupMisses = RegInit(0.U(64.W))
   private val perfNoConfTarget = RegInit(0.U(64.W))
   private val perfEnqAttempts = RegInit(0.U(64.W))
   private val perfEnqAccepted = RegInit(0.U(64.W))
   private val perfMshrBlockedCycles = RegInit(0.U(64.W))
   private val perfDupDropWithFtq = RegInit(0.U(64.W))
+  private val perfSkipNoMetaMatch = RegInit(0.U(64.W))
+  private val perfSkipNotHighCost = RegInit(0.U(64.W))
+  private val perfSkipProbability = RegInit(0.U(64.W))
   private val perfPrintInterval = 1024.U(64.W)
 
   when(io.trigger.valid && active) {
     perfTriggerReqs := perfTriggerReqs + 1.U
   }
+  when(fecLearnSeen) {
+    perfFecLineSeen := perfFecLineSeen + 1.U
+  }
   when(learnEligible) {
     perfLearnEvents := perfLearnEvents + 1.U
+  }
+  when(highPriorityLearn) {
+    perfPreferredLearnEvents := perfPreferredLearnEvents + 1.U
+  }
+  when(fecLearnSeen && !learnedMetaHit) {
+    perfSkipNoMetaMatch := perfSkipNoMetaMatch + 1.U
+  }
+  when(fecLearnSeen && learnedMetaHit && !io.fecLine.bits.highCost) {
+    perfSkipNotHighCost := perfSkipNotHighCost + 1.U
+  }
+  when(fecLearnSeen && !highPriorityLearn && !probabilityPass) {
+    perfSkipProbability := perfSkipProbability + 1.U
   }
   when(io.prefetchVaddr.fire) {
     perfTotalPrefetches := perfTotalPrefetches + 1.U
@@ -650,7 +672,7 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   private val learnToIssueRateBp = safeBasisPoints(perfTotalPrefetches, perfLearnEvents)
 
   when(io.flush) {
-    printf(p"[PDIP] stats totalPrefetches=${perfTotalPrefetches} tableLookups=${perfTableLookups} tableHits=${perfTableHits} lookupMisses=${perfLookupMisses} hitRate=${hitRate}%(${hitRateBp}bp) queueFull=${perfQueueFull} enqAttempts=${perfEnqAttempts} enqAccepted=${perfEnqAccepted} enqAcceptRate=${enqAcceptRate}%(${enqAcceptRateBp}bp) triggerReqs=${perfTriggerReqs} learnEvents=${perfLearnEvents} noConfTarget=${perfNoConfTarget} mshrBlockedCycles=${perfMshrBlockedCycles} dupDropWithFtq=${perfDupDropWithFtq} issueRate=${issueRate}%(${issueRateBp}bp) learnToIssueRate=${learnToIssueRate}%(${learnToIssueRateBp}bp) active=${active}\n")
+    printf(p"[PDIP] stats totalPrefetches=${perfTotalPrefetches} tableLookups=${perfTableLookups} tableHits=${perfTableHits} lookupMisses=${perfLookupMisses} hitRate=${hitRate}%(${hitRateBp}bp) queueFull=${perfQueueFull} enqAttempts=${perfEnqAttempts} enqAccepted=${perfEnqAccepted} enqAcceptRate=${enqAcceptRate}%(${enqAcceptRateBp}bp) triggerReqs=${perfTriggerReqs} fecLineSeen=${perfFecLineSeen} learnEvents=${perfLearnEvents} preferredLearnEvents=${perfPreferredLearnEvents} skipNoMetaMatch=${perfSkipNoMetaMatch} skipNotHighCost=${perfSkipNotHighCost} skipProbability=${perfSkipProbability} noConfTarget=${perfNoConfTarget} mshrBlockedCycles=${perfMshrBlockedCycles} dupDropWithFtq=${perfDupDropWithFtq} issueRate=${issueRate}%(${issueRateBp}bp) learnToIssueRate=${learnToIssueRate}%(${learnToIssueRateBp}bp) active=${active}\n")
   }
 
   private val periodicPrintFire =
@@ -658,7 +680,7 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
       (((perfTableLookups + 1.U) & (perfPrintInterval - 1.U)) === 0.U)
 
   when(periodicPrintFire) {
-    printf(p"[PDIP] stats (periodic) totalPrefetches=${perfTotalPrefetches} tableLookups=${perfTableLookups} tableHits=${perfTableHits} lookupMisses=${perfLookupMisses} hitRate=${hitRate}%(${hitRateBp}bp) enqAttempts=${perfEnqAttempts} enqAccepted=${perfEnqAccepted} enqAcceptRate=${enqAcceptRate}%(${enqAcceptRateBp}bp) queueFull=${perfQueueFull} noConfTarget=${perfNoConfTarget} mshrBlockedCycles=${perfMshrBlockedCycles} dupDropWithFtq=${perfDupDropWithFtq}\n")
+    printf(p"[PDIP] stats (periodic) totalPrefetches=${perfTotalPrefetches} tableLookups=${perfTableLookups} tableHits=${perfTableHits} lookupMisses=${perfLookupMisses} hitRate=${hitRate}%(${hitRateBp}bp) fecLineSeen=${perfFecLineSeen} learnEvents=${perfLearnEvents} preferredLearnEvents=${perfPreferredLearnEvents} skipNoMetaMatch=${perfSkipNoMetaMatch} skipNotHighCost=${perfSkipNotHighCost} skipProbability=${perfSkipProbability} enqAttempts=${perfEnqAttempts} enqAccepted=${perfEnqAccepted} enqAcceptRate=${enqAcceptRate}%(${enqAcceptRateBp}bp) queueFull=${perfQueueFull} noConfTarget=${perfNoConfTarget} mshrBlockedCycles=${perfMshrBlockedCycles} dupDropWithFtq=${perfDupDropWithFtq}\n")
   }
 
   io.perfInfo.totalPrefetches := perfTotalPrefetches
