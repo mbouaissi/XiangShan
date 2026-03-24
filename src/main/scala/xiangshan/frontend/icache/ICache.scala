@@ -562,6 +562,7 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
 {
   val hartId = Input(UInt(8.W))
   val prefetch    = Flipped(new FtqPrefechBundle)
+  val rob_commits = Input(Vec(CommitWidth, Valid(new RobCommitInfo)))
   val stop        = Input(Bool())
   val fetch       = new ICacheMainPipeBundle
   val toIFU       = Output(Bool())
@@ -618,10 +619,11 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   val mainPipe          = Module(new ICacheMainPipe)
   val missUnit          = Module(new ICacheMissUnit(edge))
   val fdipPrefetch      = Module(new FDIPPrefetch(edge))
+  val fecTracker        = Module(new FECTracker())
+  val pdipController    = Module(new PDIPController(PDIPParams()))
 
   fdipPrefetch.io.hartId              := io.hartId
   fdipPrefetch.io.fencei              := io.fencei
-  fdipPrefetch.io.ftqReq              <> io.prefetch
   fdipPrefetch.io.metaReadReq         <> prefetchMetaArray.io.read
   fdipPrefetch.io.metaReadResp        <> prefetchMetaArray.io.readResp
   fdipPrefetch.io.ICacheMissUnitInfo  <> missUnit.io.ICacheMissUnitInfo
@@ -631,6 +633,83 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   fdipPrefetch.io.PIQRead             <> mainPipe.io.PIQRead
   fdipPrefetch.io.metaWrite           <> DontCare
   fdipPrefetch.io.dataWrite           <> DontCare
+
+  // Drive FEC tracker using observed miss traffic and coarse pipeline progress signals.
+  private val missReqVec = VecInit(missUnit.io.req.map(_.fire))
+  private val missReqValid = missReqVec.asUInt.orR
+  private val missReqBlkPaddr = Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.paddr),
+    getBlkAddr(missUnit.io.req(1).bits.paddr)
+  )
+  private val missReqVSetIdx = Mux(
+    missReqVec(0),
+    missUnit.io.req(0).bits.getVirSetIdx,
+    missUnit.io.req(1).bits.getVirSetIdx
+  )
+
+  private val zeroFtqPtr = 0.U.asTypeOf(new FtqPtr)
+  private val lastTriggerBlkAddr = RegInit(0.U((PAddrBits - blockOffBits).W))
+  when(io.prefetch.req.fire) {
+    lastTriggerBlkAddr := getBlkAddr(io.prefetch.req.bits.target)
+  }
+
+  private val lastMissValid = RegInit(false.B)
+  when(io.fencei) {
+    lastMissValid := false.B
+  }.elsewhen(missReqValid) {
+    lastMissValid := true.B
+  }
+
+  fecTracker.io.newMiss.valid := missReqValid
+  fecTracker.io.newMiss.bits.blkPaddr := missReqBlkPaddr
+  fecTracker.io.newMiss.bits.vSetIdx := missReqVSetIdx
+  fecTracker.io.newMiss.bits.ftqIdx := zeroFtqPtr
+  fecTracker.io.stallUpdate.valid := io.stop && lastMissValid
+  fecTracker.io.stallUpdate.bits.ftqIdx := zeroFtqPtr
+  fecTracker.io.stallUpdate.bits.stalled := true.B
+  for (w <- 0 until CommitWidth) {
+    fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
+    fecTracker.io.retireUpdate(w).bits.ftqIdx := zeroFtqPtr
+  }
+  fecTracker.io.triggerAddr := lastTriggerBlkAddr
+  fecTracker.io.fencei := io.fencei
+
+  // Wire PDIP controller and merge PDIP-generated requests with FTQ prefetch stream.
+  val ftqPrefetchBlkAddr = getBlkAddr(io.prefetch.req.bits.target)
+  val pdipReqTargetVaddr = Cat(
+    pdipController.io.prefetchVaddr.bits.blkPaddr,
+    0.U(blockOffBits.W)
+  )
+  val pdipDupWithFtq =
+    pdipController.io.prefetchVaddr.valid &&
+    io.prefetch.req.valid &&
+    (pdipController.io.prefetchVaddr.bits.blkPaddr === ftqPrefetchBlkAddr)
+
+  pdipController.io.trigger.valid := io.prefetch.req.fire
+  pdipController.io.trigger.bits.blkPaddr := ftqPrefetchBlkAddr
+  pdipController.io.trigger.bits.highCostHint := false.B
+  pdipController.io.trigger.bits.controlTrigger := false.B
+  pdipController.io.trigger.bits.btbMissTrigger := false.B
+  pdipController.io.fecLine <> fecTracker.io.fecLine
+  pdipController.io.mshrAvailable := missUnit.io.req.map(_.ready).reduce(_ || _)
+  pdipController.io.flush := io.fencei
+  pdipController.io.enable := io.csr_pf_enable
+  pdipController.io.dropDupWithFtq := pdipDupWithFtq
+
+  val useFtqPrefetch = io.prefetch.req.valid
+  val usePdipPrefetch = !useFtqPrefetch && pdipController.io.prefetchVaddr.valid
+  val fdipPrefetchReady = fdipPrefetch.io.ftqReq.req.ready
+
+  fdipPrefetch.io.ftqReq.req.valid := useFtqPrefetch || usePdipPrefetch
+  fdipPrefetch.io.ftqReq.req.bits.target := Mux(
+    useFtqPrefetch,
+    io.prefetch.req.bits.target,
+    pdipReqTargetVaddr
+  )
+
+  io.prefetch.req.ready := useFtqPrefetch && fdipPrefetchReady
+  pdipController.io.prefetchVaddr.ready := usePdipPrefetch && fdipPrefetchReady
 
   // Meta Array. Priority: missUnit > fdipPrefetch
   if (prefetchToL1) {
