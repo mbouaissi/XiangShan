@@ -574,9 +574,11 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
   val csr         = new L1CacheToCsrIO
   /* CSR control signal */
   val csr_pf_enable     = Input(Bool())
+  val csr_pdip_enable   = Input(Bool())
   val csr_parity_enable = Input(Bool())
   val fencei            = Input(Bool())
   val backend_redirect  = Input(Bool())
+  val pdip_redirect     = Input(Valid(new BranchPredictionRedirect))
 }
 
 class ICache()(implicit p: Parameters) extends LazyModule with HasICacheParameters {
@@ -648,31 +650,75 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     missUnit.io.req(1).bits.getVirSetIdx
   )
 
-  private val zeroFtqPtr = 0.U.asTypeOf(new FtqPtr)
-  private val lastTriggerBlkAddr = RegInit(0.U((PAddrBits - blockOffBits).W))
-  when(io.prefetch.req.fire) {
-    lastTriggerBlkAddr := getBlkAddr(io.prefetch.req.bits.target)
+  private val fetchTriggerReqValid = io.fetch.req.fire && io.fetch.req.bits.readValid.asUInt.orR
+  private val fetchTriggerVaddr = PriorityMux(
+    io.fetch.req.bits.readValid.zip(io.fetch.req.bits.pcMemRead.map(_.startAddr))
+  )
+  private val fetchTriggerBlkAddr = getBlkAddr(fetchTriggerVaddr)
+  private val redirectTriggerBlkAddr = getBlkAddr(io.pdip_redirect.bits.cfiUpdate.pc)
+  private val redirectMatchesFetch =
+    io.pdip_redirect.valid && fetchTriggerReqValid &&
+      redirectTriggerBlkAddr === fetchTriggerBlkAddr
+
+  private val lastCommittedBranchBlkAddr =
+    RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val pendingRedirectTriggerBlkAddr =
+    RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val pendingRedirectTriggerValid = RegInit(false.B)
+
+  for (w <- 0 until CommitWidth) {
+    when(
+      io.rob_commits(w).valid &&
+        CommitType.isBranch(io.rob_commits(w).bits.commitType)
+    ) {
+      lastCommittedBranchBlkAddr := getBlkAddr(io.rob_commits(w).bits.pc)
+      pendingRedirectTriggerValid := false.B
+    }
   }
 
+  when(io.pdip_redirect.valid) {
+    pendingRedirectTriggerBlkAddr := redirectTriggerBlkAddr
+    pendingRedirectTriggerValid := true.B
+  }
+  when(io.fencei) {
+    pendingRedirectTriggerValid := false.B
+  }
+
+  private val learnTriggerBlkAddr = Mux(
+    pendingRedirectTriggerValid,
+    pendingRedirectTriggerBlkAddr,
+    lastCommittedBranchBlkAddr
+  )
+
   private val lastMissValid = RegInit(false.B)
+  private val lastMissFtqIdx = RegInit(0.U.asTypeOf(new FtqPtr))
   when(io.fencei) {
     lastMissValid := false.B
   }.elsewhen(missReqValid) {
     lastMissValid := true.B
+    lastMissFtqIdx := Mux(
+      missReqVec(0),
+      missUnit.io.req(0).bits.ftqIdx,
+      missUnit.io.req(1).bits.ftqIdx
+    )
   }
 
   fecTracker.io.newMiss.valid := missReqValid
   fecTracker.io.newMiss.bits.blkPaddr := missReqBlkPaddr
   fecTracker.io.newMiss.bits.vSetIdx := missReqVSetIdx
-  fecTracker.io.newMiss.bits.ftqIdx := zeroFtqPtr
+  fecTracker.io.newMiss.bits.ftqIdx := Mux(
+    missReqVec(0),
+    missUnit.io.req(0).bits.ftqIdx,
+    missUnit.io.req(1).bits.ftqIdx
+  )
   fecTracker.io.stallUpdate.valid := io.stop && lastMissValid
-  fecTracker.io.stallUpdate.bits.ftqIdx := zeroFtqPtr
+  fecTracker.io.stallUpdate.bits.ftqIdx := lastMissFtqIdx
   fecTracker.io.stallUpdate.bits.stalled := true.B
   for (w <- 0 until CommitWidth) {
     fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
-    fecTracker.io.retireUpdate(w).bits.ftqIdx := zeroFtqPtr
+    fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
   }
-  fecTracker.io.triggerAddr := lastTriggerBlkAddr
+  fecTracker.io.triggerAddr := learnTriggerBlkAddr
   fecTracker.io.fencei := io.fencei
 
   // Wire PDIP controller and merge PDIP-generated requests with FTQ prefetch stream.
@@ -686,15 +732,18 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     io.prefetch.req.valid &&
     (pdipController.io.prefetchVaddr.bits.blkPaddr === ftqPrefetchBlkAddr)
 
-  pdipController.io.trigger.valid := io.prefetch.req.fire
-  pdipController.io.trigger.bits.blkPaddr := ftqPrefetchBlkAddr
-  pdipController.io.trigger.bits.highCostHint := false.B
-  pdipController.io.trigger.bits.controlTrigger := false.B
-  pdipController.io.trigger.bits.btbMissTrigger := false.B
+  pdipController.io.trigger.valid := fetchTriggerReqValid
+  pdipController.io.trigger.bits.blkPaddr := fetchTriggerBlkAddr
+  pdipController.io.trigger.bits.highCostHint := redirectMatchesFetch
+  pdipController.io.trigger.bits.controlTrigger :=
+    redirectMatchesFetch && io.pdip_redirect.bits.ControlRedirectBubble
+  pdipController.io.trigger.bits.btbMissTrigger :=
+    redirectMatchesFetch &&
+      (io.pdip_redirect.bits.ControlBTBMissBubble || io.pdip_redirect.bits.BTBMissBubble)
   pdipController.io.fecLine <> fecTracker.io.fecLine
-  pdipController.io.mshrAvailable := missUnit.io.req.map(_.ready).reduce(_ || _)
+  pdipController.io.mshrThresholdMet := missUnit.io.req.map(_.ready).reduce(_ && _)
   pdipController.io.flush := io.fencei
-  pdipController.io.enable := io.csr_pf_enable
+  pdipController.io.enable := io.csr_pf_enable && io.csr_pdip_enable
   pdipController.io.dropDupWithFtq := pdipDupWithFtq
 
   val useFtqPrefetch = io.prefetch.req.valid

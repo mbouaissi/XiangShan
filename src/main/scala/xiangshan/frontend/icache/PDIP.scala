@@ -16,7 +16,7 @@ case class PDIPParams(
     numWaysPerSet: Int = 8, // Associativity of PDIP table
     numTargetsPerEntry: Int = 2, // Paper default: 2 target groups per trigger
     prefetchQueueSize: Int = 40, // Size of prefetch queue (cacheline entries)
-    mshrCheckEnabled: Boolean = true, // Check MSHR availability before prefetch
+    mshrThreshold: Int = 2, // Paper-style minimum free MSHR budget before issue
     insertProbabilityDivisor: Int = 4, // Paper-style reduced-probability learning
     minPrefetchConfidence: Int = 2, // Keep local confidence gating by default
     triggerMetaEntries: Int = 64 // Small trigger-class sidecar for selective learning
@@ -337,7 +337,7 @@ class PDIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
   val deq = DecoupledIO(new PrefetchEntry)
 
   val flush = Input(Bool())
-  val mshrAvailable = Input(Bool())
+  val mshrThresholdMet = Input(Bool())
 
   val empty = Output(Bool())
   val full = Output(Bool())
@@ -376,7 +376,7 @@ class PDIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
   }
 
   // Dequeue
-  io.deq.valid := !empty && io.mshrAvailable
+  io.deq.valid := !empty && io.mshrThresholdMet
   io.deq.bits := queue(head)
 
   when(io.deq.fire && !io.flush) {
@@ -418,7 +418,7 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
   // Output: Prefetch request to ICache
   val prefetchVaddr: DecoupledIO[PrefetchEntry] = DecoupledIO(new PrefetchEntry)
   // MSHR availability check
-  val mshrAvailable = Input(Bool())
+  val mshrThresholdMet = Input(Bool())
 
   // Flush signal
   val flush = Input(Bool())
@@ -507,17 +507,17 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
       learnedMetaHit &&
       io.fecLine.bits.highCost
   private val learnEligible =
-    highPriorityLearn || (fecLearnSeen && probabilityPass)
+    highPriorityLearn && probabilityPass
 
   pdipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
-  prefetchQueue.io.mshrAvailable := io.mshrAvailable
+  prefetchQueue.io.mshrThresholdMet := io.mshrThresholdMet
 
   // Table lookup on trigger
   pdipTable.io.lookup.req.valid := io.trigger.valid && active
   pdipTable.io.lookup.req.bits.trigger := io.trigger.bits.blkPaddr
 
-  // Learn only high-cost trigger patterns, with reduced-probability insertion.
+  // Learn only high-cost FEC lines, then apply reduced-probability insertion.
   pdipTable.io.allocate.valid := learnEligible
   pdipTable.io.allocate.bits.trigger := io.fecLine.bits.triggerAddr
   pdipTable.io.allocate.bits.target.valid := true.B
@@ -655,7 +655,7 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   when(prefetchQueue.io.enq.valid && !prefetchQueue.io.enq.ready) {
     perfQueueFull := perfQueueFull + 1.U
   }
-  when(active && !prefetchQueue.io.empty && !io.mshrAvailable) {
+  when(active && !prefetchQueue.io.empty && !io.mshrThresholdMet) {
     perfMshrBlockedCycles := perfMshrBlockedCycles + 1.U
   }
   when(io.dropDupWithFtq) {
