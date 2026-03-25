@@ -34,6 +34,7 @@ class FECCandidateEntry(implicit p: Parameters) extends ICacheBundle {
   val triggerAddr: UInt = UInt((PAddrBits - blockOffBits).W) // trigger captured at miss time
   val ftqIdx: FtqPtr = new FtqPtr // FTQ entry that caused the miss
   val allocTime: UInt = UInt(64.W) // Cycle when allocated, for aging. Basically, if too old, just free it.
+  val allocRetiredInstrs: UInt = UInt(64.W) // Global retired-instruction count when the miss was allocated.
   val stalledIFU: Bool = Bool() // Has caused a stall
   val retired: Bool = Bool() // Has had at least one instruction retire
   val stallCycles: UInt = UInt(4.W) // Saturating count of starvation cycles
@@ -67,6 +68,7 @@ class FECTrackerIO(implicit p: Parameters) extends ICacheBundle {
     val triggerAddr =
       UInt((PAddrBits - blockOffBits).W) // Block that caused redirect/mispred
     val highCost = Bool() // Decode starvation lasted at least 10 cycles
+    val starvationDistance = UInt(16.W) // Approximate retired instructions from miss allocation to FEC retirement.
   })
 
   // Trigger address 
@@ -121,6 +123,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecVSetIdx = RegInit(0.U(idxBits.W))
   private val fecTriggerAddr = RegInit(0.U((PAddrBits - blockOffBits).W))
   private val fecHighCost = RegInit(false.B)
+  private val fecStarvationDistance = RegInit(0.U(16.W))
 
   // Wire to indicate if FEC is being detected this cycle
   private val fecDetectThisCycle = WireInit(false.B)
@@ -129,14 +132,22 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecDetectVSetIdx = WireInit(0.U(idxBits.W))
   private val fecDetectTriggerAddr = WireInit(0.U((PAddrBits - blockOffBits).W))
   private val fecDetectHighCost = WireInit(false.B)
+  private val fecDetectStarvationDistance = WireInit(0.U(16.W))
 
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
+    val retiredDistanceWide = cycleRetiredInstrs - entry.allocRetiredInstrs
     fecDetectThisCycle := true.B
     fecDetectIdx := i.U
     fecDetectBlkPaddr := entry.blkPaddr
     fecDetectVSetIdx := entry.vSetIdx
     fecDetectTriggerAddr := entry.triggerAddr
     fecDetectHighCost := entry.stallCycles >= 10.U
+    fecDetectStarvationDistance :=
+      Mux(
+        retiredDistanceWide > ((1 << 16) - 1).U,
+        ((1 << 16) - 1).U,
+        retiredDistanceWide(15, 0)
+      )
 
     entriesNext(i).valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
@@ -145,6 +156,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   // Cycle counter for aging
   private val cycleCounter = RegInit(0.U(64.W))
   cycleCounter := cycleCounter + 1.U
+  private val cycleRetiredInstrs = RegInit(0.U(64.W))
+  private val committedThisCycle = PopCount(io.retireUpdate.map(_.valid))
+  cycleRetiredInstrs := cycleRetiredInstrs + committedThisCycle
 
   // Performance counters for debugging,
   // TODO: REMOVE
@@ -175,6 +189,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       entriesNext(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
       entriesNext(hitIdx).triggerAddr := io.triggerAddr
       entriesNext(hitIdx).allocTime := cycleCounter // refresh allocation time on new miss for same FTQ entry
+      entriesNext(hitIdx).allocRetiredInstrs := cycleRetiredInstrs
       entriesNext(hitIdx).stallCycles := 0.U
 
       // Debug: Log duplicate miss
@@ -192,6 +207,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       entriesNext(freeEntryIdx).triggerAddr := io.triggerAddr
       entriesNext(freeEntryIdx).ftqIdx := io.newMiss.bits.ftqIdx
       entriesNext(freeEntryIdx).allocTime := cycleCounter
+      entriesNext(freeEntryIdx).allocRetiredInstrs := cycleRetiredInstrs
       entriesNext(freeEntryIdx).stalledIFU := false.B
       entriesNext(freeEntryIdx).retired := false.B
       entriesNext(freeEntryIdx).stallCycles := 0.U
@@ -333,6 +349,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecVSetIdx := fecDetectVSetIdx
     fecTriggerAddr := fecDetectTriggerAddr
     fecHighCost := fecDetectHighCost
+    fecStarvationDistance := fecDetectStarvationDistance
   }.otherwise {
     fecDetected := false.B
   }
@@ -343,15 +360,17 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   io.fecLine.bits.vSetIdx := fecVSetIdx
   io.fecLine.bits.triggerAddr := fecTriggerAddr
   io.fecLine.bits.highCost := fecHighCost
+  io.fecLine.bits.starvationDistance := fecStarvationDistance
 
   // Debug: Log FEC line detections
   when(fecDetected) {
     printf(
-      "[FEC] Detected FEC Line: blkPaddr=0x%x vSetIdx=0x%x triggerAddr=0x%x highCost=%d cycle=%d\n",
+      "[FEC] Detected FEC Line: blkPaddr=0x%x vSetIdx=0x%x triggerAddr=0x%x highCost=%d starvationDistance=%d cycle=%d\n",
       fecBlkPaddr,
       fecVSetIdx,
       fecTriggerAddr,
       fecHighCost,
+      fecStarvationDistance,
       cycleCounter
     )
   }

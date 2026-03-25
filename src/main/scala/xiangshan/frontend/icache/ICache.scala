@@ -622,7 +622,7 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   val missUnit          = Module(new ICacheMissUnit(edge))
   val fdipPrefetch      = Module(new FDIPPrefetch(edge))
   val fecTracker        = Module(new FECTracker())
-  val pdipController    = Module(new PDIPController(PDIPParams()))
+  val epipController    = Module(new EPIPController(EPIPParams()))
 
   fdipPrefetch.io.hartId              := io.hartId
   fdipPrefetch.io.fencei              := io.fencei
@@ -721,44 +721,44 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   fecTracker.io.triggerAddr := learnTriggerBlkAddr
   fecTracker.io.fencei := io.fencei
 
-  // Wire PDIP controller and merge PDIP-generated requests with FTQ prefetch stream.
+  // Wire EPIP controller and merge EPIP-generated requests with FTQ prefetch stream.
   val ftqPrefetchBlkAddr = getBlkAddr(io.prefetch.req.bits.target)
-  val pdipReqTargetVaddr = Cat(
-    pdipController.io.prefetchVaddr.bits.blkPaddr,
+  val epipReqTargetVaddr = Cat(
+    epipController.io.prefetchVaddr.bits.blkPaddr,
     0.U(blockOffBits.W)
   )
-  val pdipDupWithFtq =
-    pdipController.io.prefetchVaddr.valid &&
+  val epipDupWithFtq =
+    epipController.io.prefetchVaddr.valid &&
     io.prefetch.req.valid &&
-    (pdipController.io.prefetchVaddr.bits.blkPaddr === ftqPrefetchBlkAddr)
+    (epipController.io.prefetchVaddr.bits.blkPaddr === ftqPrefetchBlkAddr)
 
-  pdipController.io.trigger.valid := fetchTriggerReqValid
-  pdipController.io.trigger.bits.blkPaddr := fetchTriggerBlkAddr
-  pdipController.io.trigger.bits.highCostHint := redirectMatchesFetch
-  pdipController.io.trigger.bits.controlTrigger :=
+  epipController.io.trigger.valid := fetchTriggerReqValid
+  epipController.io.trigger.bits.blkPaddr := fetchTriggerBlkAddr
+  epipController.io.trigger.bits.highCostHint := redirectMatchesFetch
+  epipController.io.trigger.bits.controlTrigger :=
     redirectMatchesFetch && io.pdip_redirect.bits.ControlRedirectBubble
-  pdipController.io.trigger.bits.btbMissTrigger :=
+  epipController.io.trigger.bits.btbMissTrigger :=
     redirectMatchesFetch &&
       (io.pdip_redirect.bits.ControlBTBMissBubble || io.pdip_redirect.bits.BTBMissBubble)
-  pdipController.io.fecLine <> fecTracker.io.fecLine
-  pdipController.io.mshrThresholdMet := missUnit.io.req.map(_.ready).reduce(_ && _)
-  pdipController.io.flush := io.fencei
-  pdipController.io.enable := io.csr_pf_enable && io.csr_pdip_enable
-  pdipController.io.dropDupWithFtq := pdipDupWithFtq
+  epipController.io.fecLine <> fecTracker.io.fecLine
+  epipController.io.mshrThresholdMet := missUnit.io.req.map(_.ready).reduce(_ && _)
+  epipController.io.flush := io.fencei
+  epipController.io.enable := io.csr_pf_enable && io.csr_pdip_enable
+  epipController.io.dropDupWithFtq := epipDupWithFtq
 
   val useFtqPrefetch = io.prefetch.req.valid
-  val usePdipPrefetch = !useFtqPrefetch && pdipController.io.prefetchVaddr.valid
+  val useEpipPrefetch = !useFtqPrefetch && epipController.io.prefetchVaddr.valid
   val fdipPrefetchReady = fdipPrefetch.io.ftqReq.req.ready
 
-  fdipPrefetch.io.ftqReq.req.valid := useFtqPrefetch || usePdipPrefetch
+  fdipPrefetch.io.ftqReq.req.valid := useFtqPrefetch || useEpipPrefetch
   fdipPrefetch.io.ftqReq.req.bits.target := Mux(
     useFtqPrefetch,
     io.prefetch.req.bits.target,
-    pdipReqTargetVaddr
+    epipReqTargetVaddr
   )
 
   io.prefetch.req.ready := useFtqPrefetch && fdipPrefetchReady
-  pdipController.io.prefetchVaddr.ready := usePdipPrefetch && fdipPrefetchReady
+  epipController.io.prefetchVaddr.ready := useEpipPrefetch && fdipPrefetchReady
 
   // Meta Array. Priority: missUnit > fdipPrefetch
   if (prefetchToL1) {
