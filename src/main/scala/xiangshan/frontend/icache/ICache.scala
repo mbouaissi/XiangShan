@@ -780,8 +780,9 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   private val pdipS1Bits  = Reg(new PrefetchEntry)
   private val pdipS1Hit   = RegInit(false.B)
 
-  // Tag occupies the upper bits of blkPaddr (above the set-index field)
-  private val pdipS0Tag   = pdipS0Bits.blkPaddr >> idxBits
+  // blkPaddr is paddr[35:6] (30 bits). Reconstruct full paddr then extract tag with get_phy_tag,
+  // which accounts for VIPT alias bits (pgUntagBits=12, not blockOffBits+idxBits=14).
+  private val pdipS0Tag   = get_phy_tag(Cat(pdipS0Bits.blkPaddr, 0.U(blockOffBits.W)))
   private val pdipHitCalc = VecInit((0 until ICacheWays).map { w =>
     val e = mirrorTagArray.io.r.resp.data(w)
     e.valid && (e.epoch === mirrorEpoch) && (e.tag === pdipS0Tag)
