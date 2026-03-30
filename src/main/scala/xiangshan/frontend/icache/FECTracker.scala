@@ -123,9 +123,8 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecDetectBlkPaddr := entry.blkPaddr
     fecDetectVSetIdx := entry.vSetIdx
     fecDetectTriggerAddr := entry.triggerAddr
-    // stallCycles is incremented once per miss (single-shot stall signal from ICache).
-    // Any MSHR miss stalls the frontend, so >= 1 is the correct "high cost" threshold.
-    fecDetectHighCost := entry.stallCycles >= 1.U
+    //High cost if stalled for 10 or more cycles according to the paper
+    fecDetectHighCost := entry.stallCycles >= 10.U
 
     entriesNext(i).valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
@@ -367,14 +366,8 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
   /** Flush Handling 
     * 
-    * IMPORTANT: Only flush on fence.i, NOT on regular pipeline flushes!
+    * Only flush on fence.i, NOT on regular pipeline flushes!
     * 
-    * Rationale:
-    * - Pipeline flushes (branch mispredictions) happen frequently (~4999 times in CoreMark)
-    * - But cache misses and stalls are still valid even after a flush
-    * - We want to track FEC lines across executions to learn patterns
-    * - Only fence.i (which invalidates the entire ICache) should clear tracker
-    * - Stale entries will age out naturally via the aging mechanism
     */
   when(io.fencei) {
     // Count entries in different states before flushing
