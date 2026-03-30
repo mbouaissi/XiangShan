@@ -84,7 +84,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     dut.io.flush.poke(false.B)
     dut.io.enq.valid.poke(false.B)
     dut.io.deq.ready.poke(false.B)
-    dut.io.mshrAvailable.poke(true.B)
+    dut.io.mshrThresholdMet.poke(true.B)
     dut.clock.step(1)
   }
   
@@ -105,7 +105,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     dut.clock.step(1)
     dut.io.flush.poke(false.B)
     dut.io.enable.poke(true.B)
-    dut.io.mshrAvailable.poke(true.B)
+    dut.io.mshrThresholdMet.poke(true.B)
     dut.io.fecLine.valid.poke(false.B)
     dut.io.trigger.valid.poke(false.B)
     dut.io.prefetchVaddr.ready.poke(true.B)
@@ -447,12 +447,12 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       enqueueOnce(dut, blkPaddr = 0x1000, vSetIdx = 0x10)
       
       // With MSHR available, dequeue should be valid
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.clock.step(1)
       assert(dut.io.deq.valid.peek().litToBoolean, "Dequeue should be valid with MSHR available")
       
       // Block MSHR
-      dut.io.mshrAvailable.poke(false.B)
+      dut.io.mshrThresholdMet.poke(false.B)
       dut.clock.step(1)
       
       // Dequeue should not be valid
@@ -471,7 +471,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       enqueueOnce(dut, blkPaddr = 0x1000)
       enqueueOnce(dut, blkPaddr = 0x2000)
       
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.io.deq.ready.poke(false.B) // Block ready
       
       val initialEmpty = dut.io.empty.peek().litToBoolean
@@ -483,7 +483,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
   
-  it should "not drain when mshrAvailable=false" in {
+  it should "not drain when mshrThresholdMet=false" in {
     test(new PDIPPrefetchQueue(queueSize = 4)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
       dut.clock.setTimeout(100)
       resetQueue(dut)
@@ -492,14 +492,14 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       enqueueOnce(dut, blkPaddr = 0x1000)
       enqueueOnce(dut, blkPaddr = 0x2000)
       
-      dut.io.mshrAvailable.poke(false.B) // Block MSHR
+      dut.io.mshrThresholdMet.poke(false.B) // Block MSHR
       dut.io.deq.ready.poke(true.B)
       
       dut.clock.step(5)
       
-      // Queue should not drain when mshrAvailable=false
-      assert(!dut.io.empty.peek().litToBoolean, "Queue should not drain when mshrAvailable=false")
-      println("[Prefetch Queue Test] Queue does not drain when mshrAvailable=false")
+      // Queue should not drain when mshrThresholdMet=false
+      assert(!dut.io.empty.peek().litToBoolean, "Queue should not drain when mshrThresholdMet=false")
+      println("[Prefetch Queue Test] Queue does not drain when mshrThresholdMet=false")
     }
   }
 
@@ -507,7 +507,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     test(new PDIPPrefetchQueue(queueSize = 4)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
-      dut.io.mshrAvailable.poke(false.B) // prevent draining
+      dut.io.mshrThresholdMet.poke(false.B) // prevent draining
       dut.io.deq.ready.poke(false.B)
 
       for (i <- 0 until 4) {
@@ -528,7 +528,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     test(new PDIPPrefetchQueue(queueSize = 4)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
-      dut.io.mshrAvailable.poke(false.B)
+      dut.io.mshrThresholdMet.poke(false.B)
       dut.io.deq.ready.poke(false.B)
 
       for (i <- 0 until 2) {
@@ -553,7 +553,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
     test(new PDIPPrefetchQueue(queueSize = 4)).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
-      dut.io.mshrAvailable.poke(false.B)
+      dut.io.mshrThresholdMet.poke(false.B)
       dut.io.deq.ready.poke(false.B)
 
       val addrs = Seq(0xAA, 0xBB, 0xCC)
@@ -565,7 +565,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       }
       dut.io.enq.valid.poke(false.B)
 
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.io.deq.ready.poke(true.B)
 
       for (a <- addrs) {
@@ -614,7 +614,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.enq.valid.poke(true.B)
       dut.io.enq.bits.blkPaddr.poke(0x2000.U)
       dut.io.enq.bits.vSetIdx.poke(0.U)
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.io.deq.ready.poke(true.B)
       
       val enqReady = dut.io.enq.ready.peek().litToBoolean
@@ -693,7 +693,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       // Initialize
       dut.io.enable.poke(true.B)
       dut.io.flush.poke(false.B)
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.clock.step(1)
       
       // Step 1: Learn from FEC line detection
@@ -738,7 +738,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       
       dut.io.enable.poke(true.B)
       dut.io.flush.poke(false.B)
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.clock.step(1)
       
       // Learn first FEC line
@@ -781,7 +781,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
       dut.io.enable.poke(false.B)
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.io.prefetchVaddr.ready.poke(true.B)
       dut.io.trigger.valid.poke(false.B)
 
@@ -809,7 +809,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
       dut.io.enable.poke(true.B)
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.io.prefetchVaddr.ready.poke(false.B)
       dut.io.trigger.valid.poke(false.B)
       dut.io.fecLine.valid.poke(false.B)
@@ -844,7 +844,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
       dut.io.enable.poke(true.B)
-      dut.io.mshrAvailable.poke(false.B)
+      dut.io.mshrThresholdMet.poke(false.B)
       dut.io.fecLine.valid.poke(false.B)
       dut.io.prefetchVaddr.ready.poke(false.B)
 
@@ -865,7 +865,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
       dut.io.enable.poke(true.B)
-      dut.io.mshrAvailable.poke(false.B)
+      dut.io.mshrThresholdMet.poke(false.B)
       dut.io.prefetchVaddr.ready.poke(false.B)
       dut.io.fecLine.valid.poke(false.B)
 
@@ -899,7 +899,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.setTimeout(200)
       dut.io.flush.poke(false.B)
       dut.io.enable.poke(true.B)
-      dut.io.mshrAvailable.poke(false.B) // prevent queue from draining
+      dut.io.mshrThresholdMet.poke(false.B) // prevent queue from draining
       dut.io.prefetchVaddr.ready.poke(false.B)
       dut.io.trigger.valid.poke(false.B)
       dut.io.fecLine.valid.poke(false.B)
@@ -928,7 +928,7 @@ class PDIPTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.setTimeout(100)
       dut.io.flush.poke(false.B)
       dut.io.enable.poke(false.B) // Disabled!
-      dut.io.mshrAvailable.poke(true.B)
+      dut.io.mshrThresholdMet.poke(true.B)
       dut.io.prefetchVaddr.ready.poke(true.B)
       
       // Try to teach a FEC line while disabled

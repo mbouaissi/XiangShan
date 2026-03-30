@@ -95,21 +95,8 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     extends ICacheModule {
   val io: FECTrackerIO = IO(new FECTrackerIO)
 
-  // Storage for tracking candidates (SRAM-backed)
-  private val entriesSram = Module(
-    new SRAMTemplate(
-      new FECCandidateEntry,
-      set = 1,
-      way = numEntries,
-      shouldReset = true,
-      holdRead = true,
-      singlePort = false
-    )
-  )
-  entriesSram.io.r.req.valid := true.B
-  entriesSram.io.r.req.bits.setIdx := 0.U.asTypeOf(entriesSram.io.r.req.bits.setIdx)
-
-  private val entriesRead = entriesSram.io.r.resp.data
+  private val entriesReg  = RegInit(VecInit(Seq.fill(numEntries)(0.U.asTypeOf(new FECCandidateEntry))))
+  private val entriesRead = entriesReg
   private val entriesNext = Wire(Vec(numEntries, new FECCandidateEntry))
   entriesNext := entriesRead
 
@@ -136,7 +123,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecDetectBlkPaddr := entry.blkPaddr
     fecDetectVSetIdx := entry.vSetIdx
     fecDetectTriggerAddr := entry.triggerAddr
-    fecDetectHighCost := entry.stallCycles >= 10.U
+    // stallCycles is incremented once per miss (single-shot stall signal from ICache).
+    // Any MSHR miss stalls the frontend, so >= 1 is the correct "high cost" threshold.
+    fecDetectHighCost := entry.stallCycles >= 1.U
 
     entriesNext(i).valid := false.B
     perfFECLinesDetected := perfFECLinesDetected + 1.U
@@ -171,17 +160,16 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     when(
       hasHit
     ) {
-      entriesNext(hitIdx).blkPaddr := io.newMiss.bits.blkPaddr
-      entriesNext(hitIdx).vSetIdx := io.newMiss.bits.vSetIdx
-      entriesNext(hitIdx).triggerAddr := io.triggerAddr
-      entriesNext(hitIdx).allocTime := cycleCounter // refresh allocation time on new miss for same FTQ entry
-      entriesNext(hitIdx).stallCycles := 0.U
-
-      // Debug: Log duplicate miss
+      // Preserve the original miss identity for a tracked FTQ entry.
+      // Rewriting blk/trigger here causes the eventual FEC attribution to drift
+      // away from the trigger that populated PDIP's lookup-side metadata.
       printf(
-        "[FEC] Miss (update): ftqIdx=%d blkPaddr=0x%x cycle=%d\n",
+        "[FEC] Miss (dup ignored): ftqIdx=%d oldBlkPaddr=0x%x newBlkPaddr=0x%x oldTrigger=0x%x newTrigger=0x%x cycle=%d\n",
         io.newMiss.bits.ftqIdx.value,
+        entriesRead(hitIdx).blkPaddr,
         io.newMiss.bits.blkPaddr,
+        entriesRead(hitIdx).triggerAddr,
+        io.triggerAddr,
         cycleCounter
       )
 
@@ -442,23 +430,5 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     )
   }
 
-  private val entriesChanged = Wire(Vec(numEntries, Bool()))
-  when(reset.asBool) {
-    entriesChanged := VecInit(Seq.fill(numEntries)(false.B))
-  }.otherwise {
-    entriesChanged := VecInit(entriesRead.zip(entriesNext).map {
-      case (prev, next) => prev.asUInt =/= next.asUInt
-    })
-  }
-  private val entriesWriteMask = entriesChanged.asUInt
-  private val entriesWriteValid = entriesWriteMask.orR
-
-  entriesSram.io.w.req.valid := entriesWriteValid
-  entriesSram.io.w.req.bits.apply(
-    data = entriesNext,
-    setIdx = 0.U.asTypeOf(entriesSram.io.w.req.bits.setIdx),
-    waymask = entriesWriteMask
-  )
-
-
+  entriesReg := entriesNext
 }

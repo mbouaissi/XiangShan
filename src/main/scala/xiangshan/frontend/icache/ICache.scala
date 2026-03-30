@@ -644,6 +644,11 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     getBlkAddr(missUnit.io.req(0).bits.paddr),
     getBlkAddr(missUnit.io.req(1).bits.paddr)
   )
+  private val missReqVBlkAddr = Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.vaddr),
+    getBlkAddr(missUnit.io.req(1).bits.vaddr)
+  )
   private val missReqVSetIdx = Mux(
     missReqVec(0),
     missUnit.io.req(0).bits.getVirSetIdx,
@@ -672,27 +677,27 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
         CommitType.isBranch(io.rob_commits(w).bits.commitType)
     ) {
       lastCommittedBranchBlkAddr := getBlkAddr(io.rob_commits(w).bits.pc)
-      pendingRedirectTriggerValid := false.B
     }
   }
 
   when(io.pdip_redirect.valid) {
     pendingRedirectTriggerBlkAddr := redirectTriggerBlkAddr
     pendingRedirectTriggerValid := true.B
+    printf(p"[PDIP2-ICache] redirect: cfiBlk=0x${Hexadecimal(redirectTriggerBlkAddr)} matchesFetch=${redirectMatchesFetch}\n")
   }
   when(io.fencei) {
     pendingRedirectTriggerValid := false.B
   }
 
-  private val learnTriggerBlkAddr = Mux(
-    pendingRedirectTriggerValid,
-    pendingRedirectTriggerBlkAddr,
-    lastCommittedBranchBlkAddr
-  )
+  private val learnTriggerBlkAddr = Mux(pendingRedirectTriggerValid, pendingRedirectTriggerBlkAddr, missReqVBlkAddr)
+
+  when(missReqValid) {
+    printf(p"[PDIP2-ICache] miss: missBlk=0x${Hexadecimal(missReqVBlkAddr)} pendingRedirValid=${pendingRedirectTriggerValid} pendingRedirBlk=0x${Hexadecimal(pendingRedirectTriggerBlkAddr)} learnTrigger=0x${Hexadecimal(learnTriggerBlkAddr)}\n")
+  }
 
   private val lastMissValid = RegInit(false.B)
   private val lastMissFtqIdx = RegInit(0.U.asTypeOf(new FtqPtr))
-  when(io.fencei) {
+  when(io.fencei || io.pdip_redirect.valid) {
     lastMissValid := false.B
   }.elsewhen(missReqValid) {
     lastMissValid := true.B
@@ -711,14 +716,26 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     missUnit.io.req(0).bits.ftqIdx,
     missUnit.io.req(1).bits.ftqIdx
   )
-  fecTracker.io.stallUpdate.valid := io.stop && lastMissValid
-  fecTracker.io.stallUpdate.bits.ftqIdx := lastMissFtqIdx
+  // Every MSHR miss stalls the frontend by definition (pipeline waits for fill).
+  // Send the stall update 1 cycle after the miss fires so the entry is already
+  // allocated in the FEC tracker when the stall update arrives.
+  private val stallMissValid = RegNext(missReqValid, false.B)
+  private val stallMissFtqIdx = RegEnable(
+    Mux(missReqVec(0), missUnit.io.req(0).bits.ftqIdx, missUnit.io.req(1).bits.ftqIdx),
+    missReqValid
+  )
+  fecTracker.io.stallUpdate.valid := stallMissValid
+  fecTracker.io.stallUpdate.bits.ftqIdx := stallMissFtqIdx
   fecTracker.io.stallUpdate.bits.stalled := true.B
   for (w <- 0 until CommitWidth) {
     fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
     fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
   }
   fecTracker.io.triggerAddr := learnTriggerBlkAddr
+  // Only flush the FEC tracker on fence.i (ICache invalidation). Regular pipeline
+  // flushes (branch mispredictions) must NOT clear it — cache misses and their
+  // stall information remain valid across redirects and we want to learn patterns
+  // across executions. Stale speculative entries age out via the aging mechanism.
   fecTracker.io.fencei := io.fencei
 
   // Wire PDIP controller and merge PDIP-generated requests with FTQ prefetch stream.
@@ -747,7 +764,9 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   pdipController.io.dropDupWithFtq := pdipDupWithFtq
 
   val useFtqPrefetch = io.prefetch.req.valid
-  val usePdipPrefetch = !useFtqPrefetch && pdipController.io.prefetchVaddr.valid
+  // PDIP disabled for FDIP-only baseline measurement. Re-enable by restoring the original line:
+  //   val usePdipPrefetch = !useFtqPrefetch && pdipController.io.prefetchVaddr.valid
+  val usePdipPrefetch = false.B
   val fdipPrefetchReady = fdipPrefetch.io.ftqReq.req.ready
 
   fdipPrefetch.io.ftqReq.req.valid := useFtqPrefetch || usePdipPrefetch
