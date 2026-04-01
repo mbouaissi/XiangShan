@@ -763,16 +763,23 @@ class PrefetchQueue(edge: TLEdgeOut)(implicit p: Parameters) extends IPrefetchMo
         state := Mux(io.mem_acquire.fire, s_memReadResp, s_memReadReq)
       }
       is(s_memReadResp) {
-        when (edge.hasData(io.mem_grant.bits) && io.mem_grant.fire) {
-          handleEntry.readBeatCnt := handleEntry.readBeatCnt + 1.U
-          handleEntry.respData(handleEntry.readBeatCnt) := io.mem_grant.bits.data
-          when (handleEntry.readBeatCnt === (refillCycles - 1).U) {
-            assert(refill_done, "refill not done!")
-            state := s_write_back
-            when (!io.fencei && !handleEntry.flash) {
-              handleEntry.issue   := false.B
-              handleEntry.finish  := true.B
+        when (io.mem_grant.fire) {
+          when (edge.hasData(io.mem_grant.bits)) {
+            handleEntry.readBeatCnt := handleEntry.readBeatCnt + 1.U
+            handleEntry.respData(handleEntry.readBeatCnt) := io.mem_grant.bits.data
+            when (handleEntry.readBeatCnt === (refillCycles - 1).U) {
+              assert(refill_done, "refill not done!")
+              state := s_write_back
+              when (!io.fencei && !handleEntry.flash) {
+                handleEntry.issue   := false.B
+                handleEntry.finish  := true.B
+              }
             }
+          } .otherwise {
+            // Non-data response (error/denied): abort this entry
+            state             := s_idle
+            handleEntry.valid := false.B
+            handleEntry.issue := false.B
           }
         }
       }

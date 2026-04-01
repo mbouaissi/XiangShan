@@ -422,7 +422,7 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
     val blkPaddr = UInt((PAddrBits - blockOffBits).W)
     val vSetIdx = UInt(idxBits.W)
     val triggerAddr =
-      UInt((PAddrBits - blockOffBits).W) // Trigger that caused this FEC
+      UInt((PAddrBits - blockOffBits).W) 
     val highCost = Bool()
   }))
 
@@ -437,7 +437,7 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
   // Enable/disable PDIP
   val enable = Input(Bool())
 
-  // Pulse when a PDIP prefetch is dropped because FTQ already has same target.
+  // Pulse when a PDIP prefetch is dropped because FTQ already has same target
   val dropDupWithFtq = Input(Bool())
 
   // Performance counters
@@ -449,8 +449,6 @@ class PDIPControllerIO(params: PDIPParams)(implicit p: Parameters)
   })
 }
 
-/** PDIP Controller Main control logic for PDIP prefetching
-  */
 class PDIPController(params: PDIPParams)(implicit p: Parameters)
     extends ICacheModule {
   val io: PDIPControllerIO = IO(new PDIPControllerIO(params))
@@ -459,7 +457,6 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   private val maxExpandedTargets =
     params.numTargetsPerEntry * expandedTargetsPerGroup
 
-  // Helper for debug-friendly percentage printing without divide-by-zero.
   private def safePercent(numerator: UInt, denominator: UInt): UInt = {
     Mux(denominator === 0.U, 0.U, (numerator * 100.U) / denominator)
   }
@@ -516,17 +513,15 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   private val probabilityPass = if (params.insertProbabilityDivisor <= 1) {
     true.B
   } else {
-    // Chisel LFSRs do not emit zero, so use modulo instead of equality to zero.
     (LFSR(16) % params.insertProbabilityDivisor.U) === 0.U
   }
 
   private val fecLearnSeen = io.fecLine.valid && active
   private val highPriorityLearn =
-    fecLearnSeen &&
       learnedMetaHit &&
       io.fecLine.bits.highCost
   private val learnEligible =
-    highPriorityLearn || (fecLearnSeen && probabilityPass)
+    fecLearnSeen &&(highPriorityLearn ||  probabilityPass)
 
   pdipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
@@ -557,6 +552,7 @@ class PDIPController(params: PDIPParams)(implicit p: Parameters)
   expandedValidVec := VecInit(Seq.fill(maxExpandedTargets)(false.B))
   expandedEntries := VecInit(Seq.fill(maxExpandedTargets)(0.U.asTypeOf(new PrefetchEntry)))
 
+// Expand compacted target groups into individual prefetch entries
   for (groupIdx <- 0 until params.numTargetsPerEntry) {
     val group = targets(groupIdx)
     val groupEnabled = group.valid && (group.confidence >= params.minPrefetchConfidence.U)

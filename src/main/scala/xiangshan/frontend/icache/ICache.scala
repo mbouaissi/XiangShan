@@ -735,17 +735,22 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     missUnit.io.req(0).bits.ftqIdx,
     missUnit.io.req(1).bits.ftqIdx
   )
-  // Every MSHR miss stalls the frontend by definition (pipeline waits for fill).
-  // Send the stall update 1 cycle after the miss fires so the entry is already
-  // allocated in the FEC tracker when the stall update arrives.
-  private val stallMissValid = RegNext(missReqValid, false.B)
-  private val stallMissFtqIdx = RegEnable(
-    Mux(missReqVec(0), missUnit.io.req(0).bits.ftqIdx, missUnit.io.req(1).bits.ftqIdx),
-    missReqValid
-  )
-  fecTracker.io.stallUpdate.valid := stallMissValid
-  fecTracker.io.stallUpdate.bits.ftqIdx := stallMissFtqIdx
-  fecTracker.io.stallUpdate.bits.stalled := true.B
+  // Cycle-accurate stall counting: send a stall update every cycle while an MSHR is
+  // active. This lets FEC entries accumulate real stall duration (typ. 38 cycles),
+  // satisfying the highCost threshold (>= 10) and enabling preferred learning.
+  // The FEC entry is allocated on newMiss (cycle T); the MSHR goes active at T+1
+  // (state != s_idle), so the first stall update arrives after the entry exists.
+  private val mshrFtqIdxReg = Reg(Vec(PortNumber, new FtqPtr))
+  for (i <- 0 until PortNumber) {
+    when(missUnit.io.req(i).fire) {
+      mshrFtqIdxReg(i) := missUnit.io.req(i).bits.ftqIdx
+    }
+  }
+  private val mshr0Active = missUnit.io.ICacheMissUnitInfo.mshr(0).valid
+  private val mshr1Active = missUnit.io.ICacheMissUnitInfo.mshr(1).valid
+  fecTracker.io.stallUpdate.valid            := mshr0Active || mshr1Active
+  fecTracker.io.stallUpdate.bits.ftqIdx     := Mux(mshr0Active, mshrFtqIdxReg(0), mshrFtqIdxReg(1))
+  fecTracker.io.stallUpdate.bits.stalled    := true.B
   for (w <- 0 until CommitWidth) {
     fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
     fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
@@ -758,24 +763,24 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   fecTracker.io.fencei := io.fencei
 
   // -----------------------------------------------------------------------
-  // PDIP: 2-stage mirror-checked prefetch pipeline (matches working commit)
-  // Stage 0 — accept request from PDIP queue, issue mirror SRAM read
-  // Stage 1 — mirror hit decision, issue to FDIP via RR arbiter
+  // 2 stage PDIP pipeline
+  // Stage 0 - request + mirror read
+  // Stage 1 - hit check and issue in S1
   // -----------------------------------------------------------------------
-  private val pdipReq       = pdipController.io.prefetchVaddr
-  private val pdipS0Pending = RegInit(false.B)
+  private val pdipReq       = pdipController.io.prefetchVaddr// vaddr to prefetch
+  private val pdipS0Pending = RegInit(false.B) 
   private val pdipS0Fire    = pdipReq.valid && pdipReq.ready
-  private val pdipS0Bits    = RegEnable(pdipReq.bits, pdipS0Fire)
-  private val pdipS1En      = RegNext(pdipS0Fire, false.B)
+  private val pdipS0Bits    = RegEnable(pdipReq.bits, pdipS0Fire) // latch the request for S1
+  private val pdipS1En      = RegNext(pdipS0Fire, false.B) 
 
   when(pdipS0Fire) { pdipS0Pending := true.B }
   when(pdipS1En)   { pdipS0Pending := false.B }
 
-  // Mirror SRAM read — resolves one cycle later in S1
+  // issue the read
   mirrorTagArray.io.r.req.valid       := pdipS0Fire
   mirrorTagArray.io.r.req.bits.setIdx := pdipReq.bits.vSetIdx
 
-  // S1: hit if any way holds the same epoch+tag
+
   private val pdipS1Valid = RegInit(false.B)
   private val pdipS1Bits  = Reg(new PrefetchEntry)
   private val pdipS1Hit   = RegInit(false.B)
