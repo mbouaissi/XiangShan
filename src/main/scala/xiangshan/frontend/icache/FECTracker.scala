@@ -4,7 +4,6 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility._
-import utility._
 import xiangshan.frontend._
 
 /** FEC Miss Information - signals a new cache miss to track */

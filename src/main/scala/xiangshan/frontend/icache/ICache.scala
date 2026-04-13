@@ -574,11 +574,11 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
   val csr         = new L1CacheToCsrIO
   /* CSR control signal */
   val csr_pf_enable     = Input(Bool())
-  val csr_pdip_enable   = Input(Bool())
+  val csr_epip_enable   = Input(Bool())
   val csr_parity_enable = Input(Bool())
   val fencei            = Input(Bool())
   val backend_redirect  = Input(Bool())
-  val pdip_redirect     = Input(Valid(new BranchPredictionRedirect))
+  val epip_redirect     = Input(Valid(new BranchPredictionRedirect))
 }
 
 class ICache()(implicit p: Parameters) extends LazyModule with HasICacheParameters {
@@ -655,9 +655,9 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     io.fetch.req.bits.readValid.zip(io.fetch.req.bits.pcMemRead.map(_.startAddr))
   )
   private val fetchTriggerBlkAddr = getBlkAddr(fetchTriggerVaddr)
-  private val redirectTriggerBlkAddr = getBlkAddr(io.pdip_redirect.bits.cfiUpdate.pc)
+  private val redirectTriggerBlkAddr = getBlkAddr(io.epip_redirect.bits.cfiUpdate.pc)
   private val redirectMatchesFetch =
-    io.pdip_redirect.valid && fetchTriggerReqValid &&
+    io.epip_redirect.valid && fetchTriggerReqValid &&
       redirectTriggerBlkAddr === fetchTriggerBlkAddr
 
   private val lastCommittedBranchBlkAddr =
@@ -676,7 +676,7 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     }
   }
 
-  when(io.pdip_redirect.valid) {
+  when(io.epip_redirect.valid) {
     pendingRedirectTriggerBlkAddr := redirectTriggerBlkAddr
     pendingRedirectTriggerValid := true.B
   }
@@ -736,14 +736,14 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   epipController.io.trigger.bits.blkPaddr := fetchTriggerBlkAddr
   epipController.io.trigger.bits.highCostHint := redirectMatchesFetch
   epipController.io.trigger.bits.controlTrigger :=
-    redirectMatchesFetch && io.pdip_redirect.bits.ControlRedirectBubble
+    redirectMatchesFetch && io.epip_redirect.bits.ControlRedirectBubble
   epipController.io.trigger.bits.btbMissTrigger :=
     redirectMatchesFetch &&
-      (io.pdip_redirect.bits.ControlBTBMissBubble || io.pdip_redirect.bits.BTBMissBubble)
+      (io.epip_redirect.bits.ControlBTBMissBubble || io.epip_redirect.bits.BTBMissBubble)
   epipController.io.fecLine <> fecTracker.io.fecLine
   epipController.io.mshrThresholdMet := missUnit.io.req.map(_.ready).reduce(_ && _)
   epipController.io.flush := io.fencei
-  epipController.io.enable := io.csr_pf_enable && io.csr_pdip_enable
+  epipController.io.enable := io.csr_pf_enable && io.csr_epip_enable
   epipController.io.dropDupWithFtq := epipDupWithFtq
 
   val useFtqPrefetch = io.prefetch.req.valid
