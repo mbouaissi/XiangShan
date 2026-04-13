@@ -495,7 +495,7 @@ class CSR(implicit p: Parameters) extends FunctionUnit with HasCSRConst with PMP
     0  << 3,    // L1D train on hit [3] init: false
     1  << 2,    // L1D pf enable [2] init: true
     1  << 1,    // L2 pf enable [1] init: true
-    1  << 0,    // L1I pf enable [0] init: true
+    1  << 0,    // L1I pf enable [0] init: true (PDIP enabled for benchmark)
   ).reduce(_|_).U(XLEN.W))
   csrio.customCtrl.l1I_pf_enable := spfctl(0)
   csrio.customCtrl.l2_pf_enable := spfctl(1)
@@ -545,7 +545,7 @@ class CSR(implicit p: Parameters) extends FunctionUnit with HasCSRConst with PMP
     (0xf & StoreBufferThreshold) |
     (EnableLdVioCheckAfterReset.toInt << 4) |
     (EnableSoftPrefetchAfterReset.toInt << 5) |
-    (EnableCacheErrorAfterReset.toInt << 6)
+    (EnableCacheErrorAfterReset.toInt << 6) |
     (EnableUncacheWriteOutstanding.toInt << 7)
   val smblockctl = RegInit(UInt(XLEN.W), smblockctl_init_val.U)
   csrio.customCtrl.sbuffer_threshold := smblockctl(3, 0)

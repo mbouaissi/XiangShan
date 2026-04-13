@@ -25,6 +25,7 @@ import freechips.rocketchip.tilelink.TLPermissions._
 import freechips.rocketchip.tilelink._
 import xiangshan._
 import xiangshan.cache._
+import xiangshan.frontend.FtqPtr
 import utils._
 import utility._
 import difftest._
@@ -41,6 +42,7 @@ class ICacheMissReq(implicit p: Parameters) extends ICacheBundle
     val paddr      = UInt(PAddrBits.W)
     val vaddr      = UInt(VAddrBits.W)
     val waymask   = UInt(nWays.W)
+    val ftqIdx    = new FtqPtr
 
     def getVirSetIdx = get_idx(vaddr)
     def getPhyTag    = get_phy_tag(paddr)
