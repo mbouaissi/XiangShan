@@ -624,9 +624,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   val fecTracker        = Module(new FECTracker())
   val pdipController    = Module(new PDIPController(PDIPParams()))
 
-  // Mirror tag array — shadow copy of ICache tags for single-cycle PDIP hit detection.
-  // Avoids sending prefetches for blocks already resident in L1.
-  // Epoch flip on fence.i makes all entries stale without explicit clearing.
   private val mirrorTagGen = new Bundle {
     val valid: Bool = Bool()
     val tag:   UInt = UInt(tagBits.W)
@@ -735,11 +732,7 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     missUnit.io.req(0).bits.ftqIdx,
     missUnit.io.req(1).bits.ftqIdx
   )
-  // Cycle-accurate stall counting: send a stall update every cycle while an MSHR is
-  // active. This lets FEC entries accumulate real stall duration (typ. 38 cycles),
-  // satisfying the highCost threshold (>= 10) and enabling preferred learning.
-  // The FEC entry is allocated on newMiss (cycle T); the MSHR goes active at T+1
-  // (state != s_idle), so the first stall update arrives after the entry exists.
+
   private val mshrFtqIdxReg = Reg(Vec(PortNumber, new FtqPtr))
   for (i <- 0 until PortNumber) {
     when(missUnit.io.req(i).fire) {
@@ -756,10 +749,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
   }
   fecTracker.io.triggerAddr := learnTriggerBlkAddr
-  // Only flush the FEC tracker on fence.i (ICache invalidation). Regular pipeline
-  // flushes (branch mispredictions) must NOT clear it — cache misses and their
-  // stall information remain valid across redirects and we want to learn patterns
-  // across executions. Stale speculative entries age out via the aging mechanism.
   fecTracker.io.fencei := io.fencei
 
   // -----------------------------------------------------------------------
@@ -767,11 +756,11 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   // Stage 0 - request + mirror read
   // Stage 1 - hit check and issue in S1
   // -----------------------------------------------------------------------
-  private val pdipReq       = pdipController.io.prefetchVaddr// vaddr to prefetch
-  private val pdipS0Pending = RegInit(false.B) 
-  private val pdipS0Fire    = pdipReq.valid && pdipReq.ready
-  private val pdipS0Bits    = RegEnable(pdipReq.bits, pdipS0Fire) // latch the request for S1
-  private val pdipS1En      = RegNext(pdipS0Fire, false.B) 
+  private val pdipReq       = pdipController.io.prefetchVaddr // incoming prefetch request (valid/ready/bits)
+  private val pdipS0Pending = RegInit(false.B)  // S0 fired but S1 not yet consumed
+  private val pdipS0Fire    = pdipReq.valid && pdipReq.ready // S0 handshake: request accepted this cycle
+  private val pdipS0Bits    = RegEnable(pdipReq.bits, pdipS0Fire) // latch request payload for S1 (aligned with SRAM resp)
+  private val pdipS1En      = RegNext(pdipS0Fire, false.B) // S1 enable: true when SRAM resp is valid
 
   when(pdipS0Fire) { pdipS0Pending := true.B }
   when(pdipS1En)   { pdipS0Pending := false.B }
@@ -785,8 +774,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   private val pdipS1Bits  = Reg(new PrefetchEntry)
   private val pdipS1Hit   = RegInit(false.B)
 
-  // blkPaddr is paddr[35:6] (30 bits). Reconstruct full paddr then extract tag with get_phy_tag,
-  // which accounts for VIPT alias bits (pgUntagBits=12, not blockOffBits+idxBits=14).
   private val pdipS0Tag   = get_phy_tag(Cat(pdipS0Bits.blkPaddr, 0.U(blockOffBits.W)))
   private val pdipHitCalc = VecInit((0 until ICacheWays).map { w =>
     val e = mirrorTagArray.io.r.resp.data(w)
@@ -802,7 +789,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   // Accept next request only when the pipeline is empty
   pdipReq.ready := !pdipS0Pending && !pdipS1Valid
 
-  // Drop mirror-hits and FTQ duplicates silently (free the slot)
   private val pdipActive     = io.csr_pf_enable && io.csr_pdip_enable
   private val pdipMirrorHit  = pdipS1Valid && pdipS1Hit
   private val pdipDupWithFtq = pdipS1Valid && io.prefetch.req.valid &&
@@ -813,11 +799,11 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     pdipS1Valid := false.B
   }
 
-  // Physical block address → FTQ-style virtual target (bare-metal: vaddr == paddr)
+  // Physical block address → FTQ-style virtual target
   private val pdipFtqReqBits = Wire(new PrefetchRequest)
   pdipFtqReqBits.target := Cat(pdipS1Bits.blkPaddr, 0.U(blockOffBits.W))
 
-  // RR arbiter — PDIP gets equal priority to FTQ prefetches (matches working commit)
+  // RR arbiter PDIP gets equal priority to FTQ prefetches
   private val prefetchArb = Module(new RRArbiter(new PrefetchRequest, 2))
   prefetchArb.io.in(0).valid := io.prefetch.req.valid
   prefetchArb.io.in(0).bits  := io.prefetch.req.bits
@@ -829,7 +815,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
 
   when(prefetchArb.io.in(1).fire) { pdipS1Valid := false.B }
 
-  // PDIP controller wiring
   pdipController.io.trigger.valid               := fetchTriggerReqValid
   pdipController.io.trigger.bits.blkPaddr       := fetchTriggerBlkAddr
   pdipController.io.trigger.bits.highCostHint   := redirectMatchesFetch
@@ -844,18 +829,13 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   pdipController.io.enable           := io.csr_pf_enable && io.csr_pdip_enable
   pdipController.io.dropDupWithFtq   := pdipDupWithFtq
 
-  // Meta Array. Priority: missUnit > fdipPrefetch
   if (prefetchToL1) {
     val meta_write_arb  = Module(new Arbiter(new ICacheMetaWriteBundle(),  2))
     meta_write_arb.io.in(0)     <> missUnit.io.meta_write
     meta_write_arb.io.in(1)     <> fdipPrefetch.io.metaWrite
     meta_write_arb.io.out       <> metaArray.io.write
-    // prefetch Meta Array. Connect meta_write_arb to ensure the data is same as metaArray
     prefetchMetaArray.io.write <> meta_write_arb.io.out
 
-    // Mirror tag array write — track ALL L1 fills: demand misses + IPF-buffer-to-L1 moves
-    // (FDIP/PDIP prefetch blocks moved to L1 on demand hit). Using the arbiter output
-    // captures both sources, preventing PDIP from re-prefetching already-cached blocks.
     val mirrorWriteData = Wire(Vec(ICacheWays, mirrorTagGen.cloneType))
     mirrorWriteData.foreach { e =>
       e.valid := true.B
@@ -871,10 +851,8 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   } else {
     missUnit.io.meta_write <> metaArray.io.write
     missUnit.io.meta_write <> prefetchMetaArray.io.write
-    // ensure together wirte to metaArray and prefetchMetaArray
     missUnit.io.meta_write.ready := metaArray.io.write.ready && prefetchMetaArray.io.write.ready
 
-    // Mirror tag array write — demand fills only (prefetchToL1 disabled).
     val mirrorWriteData = Wire(Vec(ICacheWays, mirrorTagGen.cloneType))
     mirrorWriteData.foreach { e =>
       e.valid := true.B
@@ -889,7 +867,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     )
   }
 
-  // Data Array. Priority: missUnit > fdipPrefetch
   if (prefetchToL1) {
     val data_write_arb = Module(new Arbiter(new ICacheDataWriteBundle(), 2))
     data_write_arb.io.in(0)     <> missUnit.io.data_write
