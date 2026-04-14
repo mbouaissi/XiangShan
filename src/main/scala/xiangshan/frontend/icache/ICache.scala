@@ -660,35 +660,12 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     io.epip_redirect.valid && fetchTriggerReqValid &&
       redirectTriggerBlkAddr === fetchTriggerBlkAddr
 
-  private val lastCommittedBranchBlkAddr =
-    RegInit(0.U((PAddrBits - blockOffBits).W))
-  private val pendingRedirectTriggerBlkAddr =
-    RegInit(0.U((PAddrBits - blockOffBits).W))
-  private val pendingRedirectTriggerValid = RegInit(false.B)
-
-  for (w <- 0 until CommitWidth) {
-    when(
-      io.rob_commits(w).valid &&
-        CommitType.isBranch(io.rob_commits(w).bits.commitType)
-    ) {
-      lastCommittedBranchBlkAddr := getBlkAddr(io.rob_commits(w).bits.pc)
-      pendingRedirectTriggerValid := false.B
-    }
-  }
-
-  when(io.epip_redirect.valid) {
-    pendingRedirectTriggerBlkAddr := redirectTriggerBlkAddr
-    pendingRedirectTriggerValid := true.B
-  }
-  when(io.fencei) {
-    pendingRedirectTriggerValid := false.B
-  }
-
-  private val learnTriggerBlkAddr = Mux(
-    pendingRedirectTriggerValid,
-    pendingRedirectTriggerBlkAddr,
-    lastCommittedBranchBlkAddr
-  )
+  // Hold the fetch-start block address so the FEC tracker can record it as
+  // the trigger key when a miss is detected for that fetch.  Using the
+  // fetch-start block keeps triggerMeta writes and fecLine.triggerAddr in the
+  // same address space, so learnedMetaHit can actually fire.
+  private val fetchTriggerForMiss =
+    RegEnable(fetchTriggerBlkAddr, fetchTriggerReqValid)
 
   private val lastMissValid = RegInit(false.B)
   private val lastMissFtqIdx = RegInit(0.U.asTypeOf(new FtqPtr))
@@ -718,7 +695,7 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
     fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
   }
-  fecTracker.io.triggerAddr := learnTriggerBlkAddr
+  fecTracker.io.triggerAddr := fetchTriggerForMiss
   fecTracker.io.fencei := io.fencei
 
   // Wire EPIP controller and merge EPIP-generated requests with FTQ prefetch stream.

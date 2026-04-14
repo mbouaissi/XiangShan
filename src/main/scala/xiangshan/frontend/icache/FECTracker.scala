@@ -114,6 +114,17 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val entriesNext = Wire(Vec(numEntries, new FECCandidateEntry))
   entriesNext := entriesRead
 
+  // The SRAM may output garbage on the first numEntries cycles before the
+  // shouldReset write-sweep completes.  Force all valid bits low during that
+  // window so no garbage entry can trigger aging, retire-match, or FEC
+  // detection logic.
+  private val initCounter = RegInit(0.U(log2Ceil(numEntries + 1).W))
+  private val initializing = initCounter < numEntries.U
+  when(initializing) {
+    initCounter := initCounter + 1.U
+    entriesNext.foreach(_.valid := false.B)
+  }
+
   // FEC detection state (must be defined before fireFEC uses them)
   // Use registers to hold FEC detection results for one cycle
   private val fecDetected = RegInit(false.B)
@@ -239,7 +250,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
 
   /** Caused a stall
     */
-  when(io.stallUpdate.valid) {
+  when(io.stallUpdate.valid && !initializing) {
     entriesRead.zipWithIndex.foreach { case (entry, i) =>
       when(entry.valid && entry.ftqIdx === io.stallUpdate.bits.ftqIdx) {
         val wasStalled = entry.stalledIFU
@@ -304,7 +315,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
       }
 
       entriesRead.zipWithIndex.foreach { case (entry, i) =>
-        when(entry.valid && entry.ftqIdx === io.retireUpdate(w).bits.ftqIdx) {
+        when(!initializing && entry.valid && entry.ftqIdx === io.retireUpdate(w).bits.ftqIdx) {
           val wasRetired = entry.retired
           entriesNext(i).retired := true.B
 
@@ -380,7 +391,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     */
   private val agingThreshold = 50000.U // Cycles before considering entry stale (increased from 1024)
   entriesRead.zipWithIndex.foreach { case (entry, i) =>
-    when(entry.valid && (cycleCounter - entry.allocTime) > agingThreshold) {
+    when(!initializing && entry.valid && (cycleCounter - entry.allocTime) > agingThreshold) {
       entriesNext(i).valid := false.B
       
       // Debug: Log aged entries
