@@ -104,9 +104,8 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   val io: EPIPTableIO = IO(new EPIPTableIO(params))
 
   private val zeroTarget = 0.U.asTypeOf(new EPIPTarget)
-  private val zeroTargets = 
-    VecInit(Seq.fill(params.numTargetsPerEntry)(zeroTarget)
-  )
+  private val zeroTargets =
+    VecInit(Seq.fill(params.numTargetsPerEntry)(zeroTarget))
   private val zeroEntry = 0.U.asTypeOf(
     new EPIPTableEntry(params.numTargetsPerEntry, params.lfuCounterBits)
   )
@@ -198,39 +197,44 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   // Build a pure MuxTree with Scala vars — avoids the combinational loop that
   // arises when a Wire reads back its own value through dynamic indexing.
   private def selectTargetVictim(targets: Vec[EPIPTarget]): UInt = {
-    var bestIdx: UInt        = 0.U(log2Ceil(params.numTargetsPerEntry).W)
-    var bestPriority: UInt   = targets(0).priority
+    var bestIdx: UInt = 0.U(log2Ceil(params.numTargetsPerEntry).W)
+    var bestPriority: UInt = targets(0).priority
     var bestConfidence: UInt = targets(0).confidence
-    var bestValid: Bool      = targets(0).valid
+    var bestValid: Bool = targets(0).valid
     for (i <- 1 until params.numTargetsPerEntry) {
       val isBetter = !bestValid ||
         (targets(i).valid && (
           (targets(i).priority > bestPriority) ||
-          (targets(i).priority === bestPriority && targets(i).confidence < bestConfidence)
+            (targets(i).priority === bestPriority && targets(
+              i
+            ).confidence < bestConfidence)
         ))
-      bestIdx        = Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
-      bestPriority   = Mux(isBetter, targets(i).priority,   bestPriority)
+      bestIdx =
+        Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
+      bestPriority = Mux(isBetter, targets(i).priority, bestPriority)
       bestConfidence = Mux(isBetter, targets(i).confidence, bestConfidence)
-      bestValid      = Mux(isBetter, targets(i).valid,      bestValid)
+      bestValid = Mux(isBetter, targets(i).valid, bestValid)
     }
     bestIdx
   }
 
   private def selectWayVictim(entries: Vec[EPIPTableEntry]): UInt = {
-    var bestIdx: UInt      = 0.U(log2Ceil(params.numWaysPerSet).W)
-    var bestLfu: UInt      = entries(0).lfuCount
-    var bestTrigger: UInt  = entries(0).trigger
-    var bestValid: Bool    = entries(0).valid
+    var bestIdx: UInt = 0.U(log2Ceil(params.numWaysPerSet).W)
+    var bestLfu: UInt = entries(0).lfuCount
+    var bestTrigger: UInt = entries(0).trigger
+    var bestValid: Bool = entries(0).valid
     for (i <- 1 until params.numWaysPerSet) {
       val isBetter = !bestValid ||
         (entries(i).valid && (
           (entries(i).lfuCount < bestLfu) ||
-          (entries(i).lfuCount === bestLfu && entries(i).trigger < bestTrigger)
+            (entries(i).lfuCount === bestLfu && entries(
+              i
+            ).trigger < bestTrigger)
         ))
-      bestIdx     = Mux(isBetter, i.U(log2Ceil(params.numWaysPerSet).W), bestIdx)
-      bestLfu     = Mux(isBetter, entries(i).lfuCount, bestLfu)
-      bestTrigger = Mux(isBetter, entries(i).trigger,  bestTrigger)
-      bestValid   = Mux(isBetter, entries(i).valid,    bestValid)
+      bestIdx = Mux(isBetter, i.U(log2Ceil(params.numWaysPerSet).W), bestIdx)
+      bestLfu = Mux(isBetter, entries(i).lfuCount, bestLfu)
+      bestTrigger = Mux(isBetter, entries(i).trigger, bestTrigger)
+      bestValid = Mux(isBetter, entries(i).valid, bestValid)
     }
     bestIdx
   }
@@ -435,24 +439,28 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
 
   // Pure MuxTree scan — avoids the combinational loop from Wire self-indexing.
   private val deqIdx: UInt = {
-    var bestIdx: UInt        = 0.U(log2Ceil(queueSize).W)
-    var bestPriority: UInt   = entries(0).priority
+    var bestIdx: UInt = 0.U(log2Ceil(queueSize).W)
+    var bestPriority: UInt = entries(0).priority
     var bestConfidence: UInt = entries(0).confidence
-    var bestBlkPaddr: UInt   = entries(0).blkPaddr
-    var bestValid: Bool      = valids(0)
+    var bestBlkPaddr: UInt = entries(0).blkPaddr
+    var bestValid: Bool = valids(0)
     for (i <- 1 until queueSize) {
       val isBetter = valids(i) && (
         !bestValid ||
-        (entries(i).priority < bestPriority) ||
-        (entries(i).priority === bestPriority && entries(i).confidence > bestConfidence) ||
-        (entries(i).priority === bestPriority && entries(i).confidence === bestConfidence &&
-          entries(i).blkPaddr < bestBlkPaddr)
+          (entries(i).priority < bestPriority) ||
+          (entries(i).priority === bestPriority && entries(
+            i
+          ).confidence > bestConfidence) ||
+          (entries(i).priority === bestPriority && entries(
+            i
+          ).confidence === bestConfidence &&
+            entries(i).blkPaddr < bestBlkPaddr)
       )
-      bestIdx        = Mux(isBetter, i.U(log2Ceil(queueSize).W), bestIdx)
-      bestPriority   = Mux(isBetter, entries(i).priority,   bestPriority)
+      bestIdx = Mux(isBetter, i.U(log2Ceil(queueSize).W), bestIdx)
+      bestPriority = Mux(isBetter, entries(i).priority, bestPriority)
       bestConfidence = Mux(isBetter, entries(i).confidence, bestConfidence)
-      bestBlkPaddr   = Mux(isBetter, entries(i).blkPaddr,   bestBlkPaddr)
-      bestValid      = Mux(isBetter, valids(i),              bestValid)
+      bestBlkPaddr = Mux(isBetter, entries(i).blkPaddr, bestBlkPaddr)
+      bestValid = Mux(isBetter, valids(i), bestValid)
     }
     bestIdx
   }
@@ -775,26 +783,26 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
 
   // Select the highest-urgency pending issue entry — pure MuxTree, no Wire loop.
   private val issueSel: UInt = {
-    var bestIdx: UInt        = 0.U(log2Ceil(maxExpandedTargets).W)
-    var bestPriority: UInt   = issueEntries(0).priority
+    var bestIdx: UInt = 0.U(log2Ceil(maxExpandedTargets).W)
+    var bestPriority: UInt = issueEntries(0).priority
     var bestConfidence: UInt = issueEntries(0).confidence
-    var bestBlkPaddr: UInt   = issueEntries(0).blkPaddr
-    var bestValid: Bool      = issueValids(0)
+    var bestBlkPaddr: UInt = issueEntries(0).blkPaddr
+    var bestValid: Bool = issueValids(0)
     for (i <- 1 until maxExpandedTargets) {
       val isBetter = issueValids(i) && (
         !bestValid ||
-        (issueEntries(i).priority < bestPriority) ||
-        (issueEntries(i).priority === bestPriority &&
-          issueEntries(i).confidence > bestConfidence) ||
-        (issueEntries(i).priority === bestPriority &&
-          issueEntries(i).confidence === bestConfidence &&
-          issueEntries(i).blkPaddr < bestBlkPaddr)
+          (issueEntries(i).priority < bestPriority) ||
+          (issueEntries(i).priority === bestPriority &&
+            issueEntries(i).confidence > bestConfidence) ||
+          (issueEntries(i).priority === bestPriority &&
+            issueEntries(i).confidence === bestConfidence &&
+            issueEntries(i).blkPaddr < bestBlkPaddr)
       )
-      bestIdx        = Mux(isBetter, i.U(log2Ceil(maxExpandedTargets).W), bestIdx)
-      bestPriority   = Mux(isBetter, issueEntries(i).priority,   bestPriority)
+      bestIdx = Mux(isBetter, i.U(log2Ceil(maxExpandedTargets).W), bestIdx)
+      bestPriority = Mux(isBetter, issueEntries(i).priority, bestPriority)
       bestConfidence = Mux(isBetter, issueEntries(i).confidence, bestConfidence)
-      bestBlkPaddr   = Mux(isBetter, issueEntries(i).blkPaddr,   bestBlkPaddr)
-      bestValid      = Mux(isBetter, issueValids(i),              bestValid)
+      bestBlkPaddr = Mux(isBetter, issueEntries(i).blkPaddr, bestBlkPaddr)
+      bestValid = Mux(isBetter, issueValids(i), bestValid)
     }
     bestIdx
   }
@@ -893,7 +901,9 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
     )
   }
   when(targetsValid) {
-    printf(p"[EPIP] tableHit issueBusy=${issueBusy} expandedValid=${expandedValidMask.orR}\n")
+    printf(
+      p"[EPIP] tableHit issueBusy=${issueBusy} expandedValid=${expandedValidMask.orR}\n"
+    )
   }
   when(issueCanSend) {
     printf(

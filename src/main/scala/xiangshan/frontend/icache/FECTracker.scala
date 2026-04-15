@@ -114,14 +114,17 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val entriesNext = Wire(Vec(numEntries, new FECCandidateEntry))
   entriesNext := entriesRead
 
-  // The SRAM may output garbage on the first numEntries cycles before the
-  // shouldReset write-sweep completes.  Force all valid bits low during that
-  // window so no garbage entry can trigger aging, retire-match, or FEC
-  // detection logic.
-  private val initCounter = RegInit(0.U(log2Ceil(numEntries + 1).W))
-  private val initializing = initCounter < numEntries.U
+  // Gate all logic until the SRAM's own shouldReset sweep has finished and
+  // its holdRead output has settled.  We derive this directly from
+  // io.r.req.ready (which the SRAMTemplate holds low during its reset sweep)
+  // plus one extra pipeline register for the holdRead settle cycle, so we
+  // never touch stale data regardless of RANDOMIZE_REG_INIT.
+  private val sramReadyReg  = RegInit(false.B)
+  private val sramInitDone  = RegInit(false.B)
+  sramReadyReg := entriesSram.io.r.req.ready
+  when(sramReadyReg) { sramInitDone := true.B }
+  private val initializing = !sramInitDone
   when(initializing) {
-    initCounter := initCounter + 1.U
     entriesNext.foreach(_.valid := false.B)
   }
 

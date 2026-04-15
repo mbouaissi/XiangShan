@@ -660,13 +660,6 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     io.epip_redirect.valid && fetchTriggerReqValid &&
       redirectTriggerBlkAddr === fetchTriggerBlkAddr
 
-  // Hold the fetch-start block address so the FEC tracker can record it as
-  // the trigger key when a miss is detected for that fetch.  Using the
-  // fetch-start block keeps triggerMeta writes and fecLine.triggerAddr in the
-  // same address space, so learnedMetaHit can actually fire.
-  private val fetchTriggerForMiss =
-    RegEnable(fetchTriggerBlkAddr, fetchTriggerReqValid)
-
   private val lastMissValid = RegInit(false.B)
   private val lastMissFtqIdx = RegInit(0.U.asTypeOf(new FtqPtr))
   when(io.fencei) {
@@ -695,7 +688,14 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
     fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
   }
-  fecTracker.io.triggerAddr := fetchTriggerForMiss
+  // Use the virtual block address from the miss request itself, so the FEC
+  // tracker records the exact address that caused each miss — not whatever
+  // fetch happened to be in-flight when the MSHR slot opened.
+  fecTracker.io.triggerAddr := Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.vaddr),
+    getBlkAddr(missUnit.io.req(1).bits.vaddr)
+  )
   fecTracker.io.fencei := io.fencei
 
   // Wire EPIP controller and merge EPIP-generated requests with FTQ prefetch stream.
