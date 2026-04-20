@@ -37,12 +37,14 @@ class FECTrackerTest
       dut: FECTracker,
       ftqIdx: UInt,
       blkPaddr: UInt,
-      vSetIdx: UInt
+      vSetIdx: UInt,
+      blkVaddr: UInt = 0.U
   ): Unit = {
     dut.io.newMiss.valid.poke(true.B)
     dut.io.newMiss.bits.ftqIdx.flag.poke(false.B)
     dut.io.newMiss.bits.ftqIdx.value.poke(ftqIdx)
     dut.io.newMiss.bits.blkPaddr.poke(blkPaddr)
+    dut.io.newMiss.bits.blkVaddr.poke(blkVaddr)
     dut.io.newMiss.bits.vSetIdx.poke(vSetIdx)
   }
 

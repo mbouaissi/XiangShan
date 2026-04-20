@@ -11,8 +11,8 @@ import xiangshan.frontend._
   */
 case class EPIPParams(
     enabled: Boolean = true,
-    numTableSets: Int = 512,
-    numWaysPerSet: Int = 8,
+    numTableSets: Int = 512, 
+    numWaysPerSet: Int = 8,  
     numTargetsPerEntry: Int = 2,
     prefetchQueueSize: Int = 40,
     minPrefetchConfidence: Int = 1,
@@ -502,10 +502,11 @@ class EPIPControllerIO(params: EPIPParams)(implicit p: Parameters)
   // starvationDistance: number of dynamic instructions retired between the
   // last front-end resteer and this FEC line's use (paper § IV-A).
   val fecLine = Flipped(ValidIO(new Bundle {
-    val blkPaddr = UInt((PAddrBits - blockOffBits).W)
-    val vSetIdx = UInt(idxBits.W)
-    val triggerAddr = UInt((PAddrBits - blockOffBits).W)
-    val highCost = Bool()
+    val blkPaddr           = UInt((PAddrBits - blockOffBits).W)
+    val blkVaddr           = UInt((PAddrBits - blockOffBits).W)
+    val vSetIdx            = UInt(idxBits.W)
+    val triggerAddr        = UInt((PAddrBits - blockOffBits).W)
+    val highCost           = Bool()
     val starvationDistance = UInt(16.W)
   }))
 
@@ -684,13 +685,23 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   // Discard candidates whose FEC target resides on a different virtual page
   // from the trigger instruction.  Cross-page candidates are never stored.
   // =========================================================================
+  // Compare the virtual page of the FEC miss target against the virtual page of
+  // the trigger instruction.  blkPaddr is physical so it cannot be used here —
+  // blkVaddr carries the virtual block address of the same miss and is in the
+  // same address space as triggerAddr, making the comparison meaningful.
   private val samePageCandidate =
-    pageTag(io.fecLine.bits.blkPaddr) === pageTag(io.fecLine.bits.triggerAddr)
+    pageTag(io.fecLine.bits.blkVaddr) === pageTag(io.fecLine.bits.triggerAddr)
 
-  // Learning path: FEC line seen + known trigger + high cost + same page
+  // Learning path: FEC line seen + high cost + same page.
+  // learnedMetaHit is NOT checked here: the triggerMeta has only 64 entries
+  // and the hot loop overwrites them long before a cold-miss FEC event fires,
+  // making the check structurally always false.  The triggerAddr in the FEC
+  // line already comes from s2_req_vaddr on the real MSHR request (via
+  // ICache.scala), so it is inherently a valid address — no confirmation
+  // against triggerMeta is needed.
   private val fecLearnSeen = io.fecLine.valid && active
   private val learnCandidateSeen =
-    fecLearnSeen && learnedMetaHit && io.fecLine.bits.highCost
+    fecLearnSeen && io.fecLine.bits.highCost
   private val learnEligible = learnCandidateSeen && samePageCandidate
 
   // Apply current adaptive remapping to the priority of the incoming FEC miss.

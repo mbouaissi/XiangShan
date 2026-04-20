@@ -675,6 +675,11 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
 
   fecTracker.io.newMiss.valid := missReqValid
   fecTracker.io.newMiss.bits.blkPaddr := missReqBlkPaddr
+  fecTracker.io.newMiss.bits.blkVaddr := Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.vaddr),
+    getBlkAddr(missUnit.io.req(1).bits.vaddr)
+  )
   fecTracker.io.newMiss.bits.vSetIdx := missReqVSetIdx
   fecTracker.io.newMiss.bits.ftqIdx := Mux(
     missReqVec(0),
@@ -688,14 +693,13 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
     fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
     fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
   }
-  // Use the virtual block address from the miss request itself, so the FEC
-  // tracker records the exact address that caused each miss — not whatever
-  // fetch happened to be in-flight when the MSHR slot opened.
-  fecTracker.io.triggerAddr := Mux(
-    missReqVec(0),
-    getBlkAddr(missUnit.io.req(0).bits.vaddr),
-    getBlkAddr(missUnit.io.req(1).bits.vaddr)
-  )
+  // Use the BPU's current fetch PC as the PDIP trigger, not the miss address.
+  // This gives the semantically correct "A → B" association: "when fetching A
+  // (the trigger), prefetch B (the FEC miss)".  RegEnable holds the last valid
+  // value so the trigger is well-defined even when no new fetch fires in the
+  // same cycle as a miss.
+  private val triggerForFEC = RegEnable(fetchTriggerBlkAddr, fetchTriggerReqValid)
+  fecTracker.io.triggerAddr := triggerForFEC
   fecTracker.io.fencei := io.fencei
 
   // Wire EPIP controller and merge EPIP-generated requests with FTQ prefetch stream.
