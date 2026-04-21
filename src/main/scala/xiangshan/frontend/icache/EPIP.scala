@@ -27,10 +27,10 @@ case class EPIPParams(
 
 object EPIPPriority {
   val width = 2
-  val p0 = 0.U(width.W) // Highest urgency: D < 100
-  val p1 = 1.U(width.W) // High urgency:    100 <= D <= 1000
-  val p2 = 2.U(width.W) // Medium urgency:  1000 < D <= 2000
-  val p3 = 3.U(width.W) // Low urgency:     D > 2000
+  val p0 = 0.U(width.W) // Highest prio: D < 100
+  val p1 = 1.U(width.W) // High prio:    100 <= D <= 1000
+  val p2 = 2.U(width.W) // Medium prio:  1000 < D <= 2000
+  val p3 = 3.U(width.W) // Low prio:     D > 2000
 }
 
 /** EPIP prefetch target (one FEC line stored per candidate slot). Each target
@@ -48,7 +48,7 @@ class EPIPTarget(implicit p: Parameters) extends ICacheBundle {
 }
 
 /** One entry in the EPIP table. Replaces PDIP's LRU bit with a multi-bit LFU
-  * frequency counter (paper Table I).
+  * frequency counter.
   */
 class EPIPTableEntry(numTargets: Int, lfuCounterBits: Int)(implicit
     p: Parameters
@@ -92,12 +92,7 @@ class EPIPTableIO(params: EPIPParams)(implicit p: Parameters)
   val flush = Input(Bool())
 }
 
-/** EPIP Table — enhanced PDIP table with:
-  *   - LFU replacement for entries (instead of LRU)
-  *   - Priority-based eviction for candidate slots within an entry (evict the
-  *     lowest-urgency / highest numerical priority candidate)
-  *   - LFU counter is bumped both on lookup hits ("Update on Hit") and on
-  *     training events ("Update on Training") per the paper.
+/** EPIP Table 
   */
 class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     extends ICacheModule {
@@ -194,8 +189,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
           (candidate.lfuCount === current.lfuCount && candidate.trigger < current.trigger)
       ))
 
-  // Build a pure MuxTree with Scala vars — avoids the combinational loop that
-  // arises when a Wire reads back its own value through dynamic indexing.
+  // Use MUX to avoid the combinational loop from Wire self-indexing
   private def selectTargetVictim(targets: Vec[EPIPTarget]): UInt = {
     var bestIdx: UInt = 0.U(log2Ceil(params.numTargetsPerEntry).W)
     var bestPriority: UInt = targets(0).priority
@@ -218,6 +212,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     bestIdx
   }
 
+  // Use MUX to avoid the combinational loop from Wire self-indexing
   private def selectWayVictim(entries: Vec[EPIPTableEntry]): UInt = {
     var bestIdx: UInt = 0.U(log2Ceil(params.numWaysPerSet).W)
     var bestLfu: UInt = entries(0).lfuCount
@@ -239,9 +234,6 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     bestIdx
   }
 
-  // -----------------------------------------------------------------------
-  // Lookup
-  // -----------------------------------------------------------------------
   private val matchWay = VecInit(
     readSet.map(entry => entry.valid && entry.trigger === s1LookupTrigger)
   ).asUInt
@@ -252,9 +244,6 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   io.lookup.resp.valid := s1DoLookup && hit
   io.lookup.resp.bits := Mux(hit, readSet(hitWay).targets, zeroTargets)
 
-  // -----------------------------------------------------------------------
-  // Write path (shared for alloc and lookup-hit LFU update)
-  // -----------------------------------------------------------------------
   private val writeData = Wire(
     Vec(
       params.numWaysPerSet,
@@ -273,14 +262,11 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     ).asUInt
 
     when(existingWayOH.orR) {
-      // ---- Trigger already present: update entry ----
       val existingWay = PriorityEncoder(existingWayOH)
       val existingEntry = readSet(existingWay)
       val updatedEntry = WireInit(existingEntry)
       val targetSlots = existingEntry.targets
 
-      // LFU "Update on Training": bump frequency whenever this trigger is
-      // involved in a new training event.
       updatedEntry.lfuCount := bumpLfu(existingEntry.lfuCount)
 
       // Check whether the new target is already represented (exact or compacted).
@@ -296,7 +282,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
 
       when(existingTargetOH.orR) {
         // Target already covered: strengthen confidence and keep the higher
-        // urgency (lower numerical) priority.
+        // priority (lower numerical) priority.
         val idx = PriorityEncoder(existingTargetOH)
         updatedEntry.targets(idx).confidence :=
           Mux(
@@ -398,10 +384,6 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   )
 }
 
-// ---------------------------------------------------------------------------
-// Prefetch Queue
-// ---------------------------------------------------------------------------
-
 class EPIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
     extends ICacheBundle {
   val enq = Flipped(DecoupledIO(new EPIPIssueEntry))
@@ -437,7 +419,7 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
   private val full = valids.andR
   private val enqIdx = PriorityEncoder(invalidMask)
 
-  // Pure MuxTree scan — avoids the combinational loop from Wire self-indexing.
+  // Use MUX to avoid the combinational loop from Wire self-indexing
   private val deqIdx: UInt = {
     var bestIdx: UInt = 0.U(log2Ceil(queueSize).W)
     var bestPriority: UInt = entries(0).priority
@@ -552,10 +534,10 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   private val expandedTargetsPerGroup = 5
   private val maxExpandedTargets =
     params.numTargetsPerEntry * expandedTargetsPerGroup
-  // Number of cache-line-sized blocks per 4 KB page
+  // 12 bc Log2Ceil(64B block / 4B word) = block offset bits
   private val pageBlockBits = 12 - blockOffBits
 
-  private def safePercent(numerator: UInt, denominator: UInt): UInt =
+  private def myPercent(numerator: UInt, denominator: UInt): UInt =
     Mux(denominator === 0.U, 0.U, (numerator * 100.U) / denominator)
 
   // Extract the virtual page number from a block address.
@@ -563,6 +545,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
     if (pageBlockBits > 0) blkAddr(blkAddr.getWidth - 1, pageBlockBits)
     else blkAddr
 
+  // wrap to avoid exceeding the maximum vSetIdx
   private def incrementVSetIdx(base: UInt, delta: Int): UInt =
     ((base + delta.U)(idxBits - 1, 0)).asUInt
 
@@ -582,9 +565,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
     )
 
   // -----------------------------------------------------------------------
-  // Adaptive priority remapping (paper § IV-A-3)
-  // "Elevates priority 1 to act as the new priority 0 in the next interval."
-  // Only P1 is promoted; P0 (already highest urgency) remains unchanged.
+  // Adaptive priority remapping 
   // -----------------------------------------------------------------------
   private def remapPriority(priority: UInt, promoteP1: Bool): UInt =
     Mux(promoteP1 && priority === EPIPPriority.p1, EPIPPriority.p0, priority)
@@ -629,11 +610,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   }
 
   // =========================================================================
-  // Counter Controller — Adaptive Priority Assignment (paper § IV-A-3)
-  //
-  // Observes EVERY FEC starvation event (not just filtered candidates) so
-  // that the phase-detection accurately reflects the application's behaviour.
-  // Window size = priorityAdaptWindow FEC events (default 5000).
+  // Counter Controller — Adaptive Priority Assignment
   // =========================================================================
   private val fecEventSeen = io.fecLine.valid && active
   private val fecEventPriority = classifyPriority(
@@ -681,14 +658,8 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   }
 
   // =========================================================================
-  // Page Event Detector (paper § IV-B-4)
-  // Discard candidates whose FEC target resides on a different virtual page
-  // from the trigger instruction.  Cross-page candidates are never stored.
+  // Page Event Detector 
   // =========================================================================
-  // Compare the virtual page of the FEC miss target against the virtual page of
-  // the trigger instruction.  blkPaddr is physical so it cannot be used here —
-  // blkVaddr carries the virtual block address of the same miss and is in the
-  // same address space as triggerAddr, making the comparison meaningful.
   private val samePageCandidate =
     pageTag(io.fecLine.bits.blkVaddr) === pageTag(io.fecLine.bits.triggerAddr)
 
@@ -792,7 +763,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   }
   when(io.flush) { issueValids := 0.U }
 
-  // Select the highest-urgency pending issue entry — pure MuxTree, no Wire loop.
+  // Use MUX to avoid the combinational loop from Wire self-indexing
   private val issueSel: UInt = {
     var bestIdx: UInt = 0.U(log2Ceil(maxExpandedTargets).W)
     var bestPriority: UInt = issueEntries(0).priority
@@ -882,7 +853,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
     perfAdaptivePromotions := perfAdaptivePromotions + 1.U
   }
 
-  private val hitRate = safePercent(perfTableHits, perfTableLookups)
+  private val hitRate = myPercent(perfTableHits, perfTableLookups)
 
   when(active && !activeReg) {
     printf(p"[EPIP] active enable=${io.enable} flush=${io.flush}\n")
