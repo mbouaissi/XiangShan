@@ -127,7 +127,7 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
   private val fecDetectStarvationDist    = WireInit(0.U(16.W))
 
   private def fireFEC(entry: FECCandidateEntry, i: Int): Unit = {
-    val retiredDistanceWide = cycleRetiredInstrs - entry.allocRetiredInstrs
+    val retiredDistance = cycleRetiredInstrs - entry.allocRetiredInstrs
     fecDetectThisCycle      := true.B
     fecDetectBlkPaddr       := entry.blkPaddr
     fecDetectBlkVaddr       := entry.blkVaddr
@@ -136,9 +136,9 @@ class FECTracker(numEntries: Int = 16)(implicit p: Parameters)
     fecDetectHighCost       := entry.stallCycles >= 10.U
     fecDetectStarvationDist :=
       Mux(
-        retiredDistanceWide > ((1 << 16) - 1).U,
+        retiredDistance > ((1 << 16) - 1).U,
         ((1 << 16) - 1).U,
-        retiredDistanceWide(15, 0)
+        retiredDistance(15, 0)
       )
     entriesNext(i).valid    := false.B
     perfFECLinesDetected    := perfFECLinesDetected + 1.U

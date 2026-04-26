@@ -2,7 +2,6 @@ package xiangshan.frontend.icache
 
 import chisel3._
 import chisel3.util._
-import chisel3.util.random.LFSR
 import org.chipsalliance.cde.config.Parameters
 import utility._
 import xiangshan.frontend._
@@ -15,7 +14,6 @@ case class EPIPParams(
     numWaysPerSet: Int = 8,  
     numTargetsPerEntry: Int = 2,
     prefetchQueueSize: Int = 40,
-    insertProbabilityDivisor: Int = 1,
     triggerMetaEntries: Int = 64,
     lfuCounterBits: Int = 12,
     priorityAdaptWindow: Int = 5000,
@@ -218,9 +216,9 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       updatedEntry.lfuCount := increaseLFU(readSet(existingTrigger).lfuCount)
 
       val existingTargetOH = VecInit(
-        targetSlots.map(t => t.valid && t.blkPaddr === s1AllocTarget.blkPaddr)
+        targetSlots.map(target => target.valid && target.blkPaddr === s1AllocTarget.blkPaddr)
       ).asUInt
-      val invalidTargetOH = VecInit(targetSlots.map(t => !t.valid)).asUInt
+      val invalidTargetOH = VecInit(targetSlots.map(target => !target.valid)).asUInt
 
       when(existingTargetOH.orR) {
         val idx = PriorityEncoder(existingTargetOH)
@@ -307,9 +305,8 @@ class EPIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
   val full = Output(Bool())
 }
 
-/** Priority-based prefetch queue. Dequeues the entry with the highest urgency
-  * (lowest numerical priority) first, ensuring the most time-critical FEC
-  * misses are issued to the cache before less urgent ones.
+/** Priority based prefetch queue. Dequeue only when MSHR threshold is met, 
+ * and always issue the candidate with the highest priority. 
   */
 class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
     extends ICacheModule {
@@ -325,7 +322,6 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
   private val full = valids.andR
   private val enqIdx = PriorityEncoder(invalidMask)
 
-  // Use MUX to avoid the combinational loop from Wire self-indexing
   private val deqIdx: UInt = {
     var bestIdx: UInt      = 0.U(log2Ceil(queueSize).W)
     var bestPriority: UInt = entries(0).priority
@@ -372,9 +368,6 @@ class EPIPControllerIO(params: EPIPParams)(implicit p: Parameters)
     val btbMissTrigger = Bool()
   }))
 
-  // FEC starvation event reported by the retire stage.
-  // starvationDistance: number of dynamic instructions retired between the
-  // last front-end resteer and this FEC line's use (paper § IV-A).
   val fecLine = Flipped(ValidIO(new Bundle {
     val blkPaddr           = UInt((PAddrBits - blockOffBits).W)
     val blkVaddr           = UInt((PAddrBits - blockOffBits).W)
@@ -400,24 +393,7 @@ class EPIPControllerIO(params: EPIPParams)(implicit p: Parameters)
   })
 }
 
-/** EPIP Controller
-  *
-  * Orchestrates three components on top of the PDIP baseline:
-  *
-  *   1. Counter Controller (adaptive priority assignment): Observes ALL FEC
-  *      starvation events coming from the retire stage and maintains two
-  *      counters — one for P0 events (distance < 100) and one for P1 events
-  *      (100 ≤ distance ≤ 1000) — within a sliding window of 5000 FEC events.
-  *      At the end of each window, if P0 events were fewer than P1 events the
-  *      controller sets `promoteP1`, which causes P1 candidates to be treated
-  *      as P0 (highest urgency) during both learning and issue in the next
-  *      window.
-  *   2. Enhanced EPIP Table: LFU entry replacement + priority-based candidate
-  *      eviction.
-  *   3. Page Event Detector: Cross-page candidates are discarded at training
-  *      time — when the VPN of the FEC target differs from the VPN of its
-  *      trigger, the candidate is never written to the table, saving storage
-  *      and avoiding useless cross-page prefetches.
+/** EPIP Controllerrr
   */
 class EPIPController(params: EPIPParams)(implicit p: Parameters)
     extends ICacheModule {
@@ -504,9 +480,8 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   private val promoteP1 = RegInit(false.B)
 
   when(fecEventSeen) {
-    when(windowEvents === (params.priorityAdaptWindow - 1).U) {
-      // End of interval: compare counts and decide for the NEXT interval.
-      // Per paper: if P0 events < P1 events, elevate P1 to highest urgency.
+    when(windowEvents === (params.priorityAdaptWindow - 1).U) {//When 5000 FEC events
+      //Elevate P1 to P0 if there were more P1 events than P0
       promoteP1 := p0WindowCount < p1WindowCount
       p0WindowCount := 0.U
       p1WindowCount := 0.U
@@ -542,43 +517,26 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   private val samePageCandidate =
     pageTag(io.fecLine.bits.blkVaddr) === pageTag(io.fecLine.bits.triggerAddr)
 
-  // Learning path: FEC line seen + high cost + same page.
-  // learnedMetaHit is NOT checked here: the triggerMeta has only 64 entries
-  // and the hot loop overwrites them long before a cold-miss FEC event fires,
-  // making the check structurally always false.  The triggerAddr in the FEC
-  // line already comes from s2_req_vaddr on the real MSHR request (via
-  // ICache.scala), so it is inherently a valid address — no confirmation
-  // against triggerMeta is needed.
   private val fecLearnSeen = io.fecLine.valid && active
   private val learnCandidateSeen =
     fecLearnSeen && io.fecLine.bits.highCost
   private val learnEligible = learnCandidateSeen && samePageCandidate
 
-  // Apply current adaptive remapping to the priority of the incoming FEC miss.
+
   private val rawLearnPriority = classifyPriority(
     io.fecLine.bits.starvationDistance
   )
   private val effectiveLearnPriority =
     remapPriority(rawLearnPriority, promoteP1)
 
-  private val probabilityPass = if (params.insertProbabilityDivisor <= 1) {
-    true.B
-  } else {
-    val randomWidth = log2Ceil(params.insertProbabilityDivisor)
-    val randomValue = LFSR(randomWidth max 2)
-    randomValue === 0.U
-  }
-
   epipTable.io.flush := io.flush
   prefetchQueue.io.flush := io.flush
   prefetchQueue.io.mshrThresholdMet := io.mshrThresholdMet
-
-  // Table lookup: probe on every trigger from the BPU
+ 
   epipTable.io.lookup.req.valid := io.trigger.valid && active
   epipTable.io.lookup.req.bits.trigger := io.trigger.bits.blkPaddr
 
-  // Table training: store (trigger → FEC target + priority) for eligible events
-  epipTable.io.allocate.valid := learnEligible && probabilityPass
+  epipTable.io.allocate.valid := learnEligible
   epipTable.io.allocate.bits.trigger := io.fecLine.bits.triggerAddr
   epipTable.io.allocate.bits.target.valid := true.B
   epipTable.io.allocate.bits.target.blkPaddr := io.fecLine.bits.blkPaddr
@@ -591,30 +549,20 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   // -----------------------------------------------------------------------
   // Issue the 2 stored targets directly, applying adaptive remapping.
   // -----------------------------------------------------------------------
-  private val candidateValidVec = Wire(Vec(params.numTargetsPerEntry, Bool()))
-  private val candidateEntries  = Wire(Vec(params.numTargetsPerEntry, new EPIPIssueEntry))
-
-  for (i <- 0 until params.numTargetsPerEntry) {
-    val t = targets(i)
-    candidateValidVec(i)         := t.valid
-    candidateEntries(i).blkPaddr := t.blkPaddr
-    candidateEntries(i).vSetIdx  := t.vSetIdx
-    candidateEntries(i).priority := remapPriority(t.priority, promoteP1)
-  }
-
-  private val candidateValidMask = candidateValidVec.asUInt
-
   private val issueEntries = Reg(Vec(params.numTargetsPerEntry, new EPIPIssueEntry))
   private val issueValids  = RegInit(0.U(params.numTargetsPerEntry.W))
   private val issueBusy    = issueValids.orR
 
-  when(targetsValid && candidateValidMask.orR && !issueBusy) {
-    issueEntries := candidateEntries
-    issueValids  := candidateValidMask
+  when(targetsValid && targets.map(target => target.valid).reduce(_ || _) && !issueBusy) {
+    for (i <- 0 until params.numTargetsPerEntry) {
+      issueEntries(i).blkPaddr := targets(i).blkPaddr
+      issueEntries(i).vSetIdx  := targets(i).vSetIdx
+      issueEntries(i).priority := remapPriority(targets(i).priority, promoteP1)
+    }
+    issueValids := VecInit(targets.map(_.valid)).asUInt
   }
   when(io.flush) { issueValids := 0.U }
 
-  // Use MUX to avoid the combinational loop from Wire self-indexing
   private val issueSel: UInt = {
     var bestIdx: UInt      = 0.U(log2Ceil(params.numTargetsPerEntry).W)
     var bestPriority: UInt = issueEntries(0).priority
@@ -677,7 +625,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
       is(EPIPPriority.p3) { perfFecP3Events := perfFecP3Events + 1.U }
     }
   }
-  when(learnEligible && probabilityPass) {
+  when(learnEligible) {
     perfLearnEvents := perfLearnEvents + 1.U
   }
   when(learnCandidateSeen && !samePageCandidate) {
@@ -712,10 +660,10 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   when(learnCandidateSeen) {
     printf(
       p"[EPIP] learnCandidateSeen trigger=0x${Hexadecimal(io.fecLine.bits.triggerAddr)}" +
-        p" samePageCandidate=${samePageCandidate} probabilityPass=${probabilityPass}\n"
+        p" samePageCandidate=${samePageCandidate}\n"
     )
   }
-  when(learnEligible && probabilityPass) {
+  when(learnEligible) {
     printf(
       p"[EPIP] learn trigger=0x${Hexadecimal(io.fecLine.bits.triggerAddr)}" +
         p" target=0x${Hexadecimal(io.fecLine.bits.blkPaddr)}\n"
@@ -723,7 +671,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   }
   when(targetsValid) {
     printf(
-      p"[EPIP] tableHit issueBusy=${issueBusy} candidateValid=${candidateValidMask.orR}\n"
+      p"[EPIP] tableHit issueBusy=${issueBusy} anyTargetValid=${targets.map(_.valid).reduce(_ || _)}\n"
     )
   }
   when(issueCanSend) {
