@@ -15,7 +15,6 @@ case class EPIPParams(
     numWaysPerSet: Int = 8,  
     numTargetsPerEntry: Int = 2,
     prefetchQueueSize: Int = 40,
-    minPrefetchConfidence: Int = 1,
     insertProbabilityDivisor: Int = 1,
     triggerMetaEntries: Int = 64,
     lfuCounterBits: Int = 12,
@@ -33,17 +32,13 @@ object EPIPPriority {
   val p3 = 3.U(width.W) // Low prio:     D > 2000
 }
 
-/** EPIP prefetch target (one FEC line stored per candidate slot). Each target
-  * holds the block address, virtual set index, a 4-bit compaction mask for up
-  * to four sequential successor blocks, a 2-bit confidence counter, and a 2-bit
-  * priority derived from the starvation-to-reuse distance.
+/** EPIP prefetch target. Each target holds the block address, virtual set
+  * index, and a 2-bit priority derived from the starvation-to-reuse distance.
   */
 class EPIPTarget(implicit p: Parameters) extends ICacheBundle {
   val valid: Bool = Bool()
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W)
   val vSetIdx: UInt = UInt(idxBits.W)
-  val compactMask: UInt = UInt(4.W)
-  val confidence: UInt = UInt(2.W)
   val priority: UInt = UInt(EPIPPriority.width.W)
 }
 
@@ -67,12 +62,10 @@ class EPIPTriggerMeta(implicit p: Parameters) extends ICacheBundle {
   val btbMissTrigger: Bool = Bool()
 }
 
-/** Issue entry carries priority and confidence through the prefetch queue. */
 class EPIPIssueEntry(implicit p: Parameters) extends ICacheBundle {
   val blkPaddr: UInt = UInt((PAddrBits - blockOffBits).W)
   val vSetIdx: UInt = UInt(idxBits.W)
   val priority: UInt = UInt(EPIPPriority.width.W)
-  val confidence: UInt = UInt(2.W)
 }
 
 class EPIPTableIO(params: EPIPParams)(implicit p: Parameters)
@@ -149,45 +142,27 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     RegEnable(io.lookup.req.bits.trigger, readDoLookup)
   private val readSet = table.io.r.resp.data
 
-  // Offset of newBlkPaddr relative to the base block of an existing target.
-  // Valid range is 1..4 (we subtract 1 to map to compactMask bits 0..3).
-  private def compactableOffset(target: EPIPTarget, newBlkPaddr: UInt): UInt =
-    newBlkPaddr - target.blkPaddr - 1.U
-
-  private def canCompact(target: EPIPTarget, newBlkPaddr: UInt): Bool =
-    target.valid &&
-      newBlkPaddr > target.blkPaddr &&
-      newBlkPaddr <= (target.blkPaddr + 4.U)
-
   // Saturating increment for the LFU counter.
   private def increaseLFU(count: UInt): UInt =
     Mux(count.andR, count, count + 1.U)
 
   // Use MUX to avoid the combinational loop from Wire self-indexing
   private def selectTargetVictim(targets: Vec[EPIPTarget]): UInt = {
-    var bestIdx: UInt = 0.U(log2Ceil(params.numTargetsPerEntry).W)
+    var bestIdx: UInt      = 0.U(log2Ceil(params.numTargetsPerEntry).W)
     var bestPriority: UInt = targets(0).priority
-    var bestConfidence: UInt = targets(0).confidence
-    var bestValid: Bool = targets(0).valid
+    var bestValid: Bool    = targets(0).valid
     for (i <- 1 until params.numTargetsPerEntry) {
       val isBetter = !bestValid ||
-        (targets(i).valid && (
-          (targets(i).priority > bestPriority) ||
-            (targets(i).priority === bestPriority && targets(
-              i
-            ).confidence < bestConfidence)
-        ))
-      bestIdx =
-        Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
+        (targets(i).valid && targets(i).priority > bestPriority)
+      bestIdx      = Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
       bestPriority = Mux(isBetter, targets(i).priority, bestPriority)
-      bestConfidence = Mux(isBetter, targets(i).confidence, bestConfidence)
-      bestValid = Mux(isBetter, targets(i).valid, bestValid)
+      bestValid    = Mux(isBetter, targets(i).valid, bestValid)
     }
     bestIdx
   }
 
   // Use MUX to avoid the combinational loop from Wire self-indexing
-  private def selectWayVictim(entries: Vec[EPIPTableEntry]): UInt = {
+  private def selectTriggerVictim(entries: Vec[EPIPTableEntry]): UInt = {
     var bestIdx: UInt = 0.U(log2Ceil(params.numWaysPerSet).W)
     var bestLfu: UInt = entries(0).lfuCount
     var bestTrigger: UInt = entries(0).trigger
@@ -208,15 +183,15 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     bestIdx
   }
 
-  private val matchWay = VecInit(
+  private val matchTrigger = VecInit(
     readSet.map(entry => entry.valid && entry.trigger === s1LookupTrigger)
   ).asUInt
-  private val hitWay = PriorityEncoder(matchWay)
-  private val hitWayOH = PriorityEncoderOH(matchWay)
-  private val hit = matchWay.orR
+  private val hitTrigger = PriorityEncoder(matchTrigger)
+  private val hitTriggerOH = PriorityEncoderOH(matchTrigger)
+  private val hit = matchTrigger.orR
 
   io.lookup.resp.valid := s1DoLookup && hit
-  io.lookup.resp.bits := Mux(hit, readSet(hitWay).targets, nothing)
+  io.lookup.resp.bits := Mux(hit, readSet(hitTrigger).targets, nothing)
 
   private val writeData = Wire(
     Vec(
@@ -231,64 +206,31 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   writeValid := false.B
 
   when(s1DoAlloc) {
-    val existingWayOH = VecInit(
+    val existingTriggerOH = VecInit(
       readSet.map(entry => entry.valid && entry.trigger === s1AllocTrigger)
     ).asUInt
 
-    when(existingWayOH.orR) {
-      val existingWay = PriorityEncoder(existingWayOH)
-      val updatedEntry = WireInit(readSet(existingWay))
-      val targetSlots = readSet(existingWay).targets
+    when(existingTriggerOH.orR) {
+      val existingTrigger = PriorityEncoder(existingTriggerOH)
+      val updatedEntry = WireInit(readSet(existingTrigger))
+      val targetSlots = readSet(existingTrigger).targets
 
-      updatedEntry.lfuCount := increaseLFU(readSet(existingWay).lfuCount)
+      updatedEntry.lfuCount := increaseLFU(readSet(existingTrigger).lfuCount)
 
-      //Is target present?
-      val existingTargetOH = VecInit(targetSlots.map(target => {
-        val offset = compactableOffset(target, s1AllocTarget.blkPaddr)
-        (target.valid && target.blkPaddr === s1AllocTarget.blkPaddr) ||
-        (canCompact(target, s1AllocTarget.blkPaddr) && target.compactMask(offset(1, 0)))
-      })).asUInt
-      val targetCanCompactOH = VecInit(
-        targetSlots.map(t => canCompact(t, s1AllocTarget.blkPaddr))
+      val existingTargetOH = VecInit(
+        targetSlots.map(t => t.valid && t.blkPaddr === s1AllocTarget.blkPaddr)
       ).asUInt
       val invalidTargetOH = VecInit(targetSlots.map(t => !t.valid)).asUInt
 
       when(existingTargetOH.orR) {
-        //Increase the confidence of the existing target
         val idx = PriorityEncoder(existingTargetOH)
-        updatedEntry.targets(idx).confidence :=
-          Mux(
-            targetSlots(idx).confidence === 3.U,
-            3.U,
-            targetSlots(idx).confidence + 1.U
-          )
         updatedEntry.targets(idx).priority :=
           Mux(
             s1AllocTarget.priority < targetSlots(idx).priority,
             s1AllocTarget.priority,
             targetSlots(idx).priority
           )
-      }.elsewhen(targetCanCompactOH.orR) {
-        // CCompact the new target into the first eligible slot
-        val compactIdx = PriorityEncoder(targetCanCompactOH)
-        val compactOffset =
-          compactableOffset(targetSlots(compactIdx), s1AllocTarget.blkPaddr)
-        updatedEntry.targets(compactIdx).compactMask :=
-          targetSlots(compactIdx).compactMask | UIntToOH(compactOffset(1, 0), 4)
-        updatedEntry.targets(compactIdx).confidence :=
-          Mux(
-            targetSlots(compactIdx).confidence === 3.U,
-            3.U,
-            targetSlots(compactIdx).confidence + 1.U
-          )
-        updatedEntry.targets(compactIdx).priority :=
-          Mux(
-            s1AllocTarget.priority < targetSlots(compactIdx).priority,
-            s1AllocTarget.priority,
-            targetSlots(compactIdx).priority
-          )
       }.otherwise {
-        // Allocate the new target into either an invalid slot or the victim slot
         val replaceIdx = Mux(
           invalidTargetOH.orR,
           PriorityEncoder(invalidTargetOH),
@@ -298,38 +240,38 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
         updatedEntry.targets(replaceIdx).valid := true.B
       }
 
-      writeData(existingWay) := updatedEntry
-      writeMask := UIntToOH(existingWay, params.numWaysPerSet)
+      writeData(existingTrigger) := updatedEntry
+      writeMask := UIntToOH(existingTrigger, params.numWaysPerSet)
       writeValid := true.B
 
     }.otherwise {
       // No existing entry for this trigger; allocate a new one
-      val invalidWayOH = VecInit(readSet.map(entry => !entry.valid)).asUInt
-      val replaceWay = Mux(
-        invalidWayOH.orR,
-        PriorityEncoder(invalidWayOH),
-        selectWayVictim(readSet)
+      val invalidTriggerOH = VecInit(readSet.map(entry => !entry.valid)).asUInt
+      val replaceTrigger = Mux(
+        invalidTriggerOH.orR,
+        PriorityEncoder(invalidTriggerOH),
+        selectTriggerVictim(readSet)
       )
       val newEntry = Wire(
         new EPIPTableEntry(params.numTargetsPerEntry, params.lfuCounterBits)
       )
       newEntry.valid := true.B
       newEntry.trigger := s1AllocTrigger
-      newEntry.lfuCount := 1.U // First training event for this trigger
+      newEntry.lfuCount := 1.U 
       newEntry.targets := nothing
       newEntry.targets(0) := s1AllocTarget
       newEntry.targets(0).valid := true.B
-      writeData(replaceWay) := newEntry
-      writeMask := UIntToOH(replaceWay, params.numWaysPerSet)
+      writeData(replaceTrigger) := newEntry
+      writeMask := UIntToOH(replaceTrigger, params.numWaysPerSet)
       writeValid := true.B
     }
 
   }.elsewhen(s1DoLookup && hit) {
     // Bump for LFU
-    val updatedEntry = WireInit(readSet(hitWay))
-    updatedEntry.lfuCount := increaseLFU(readSet(hitWay).lfuCount)
-    writeData(hitWay) := updatedEntry
-    writeMask := hitWayOH
+    val updatedEntry = WireInit(readSet(hitTrigger))
+    updatedEntry.lfuCount := increaseLFU(readSet(hitTrigger).lfuCount)
+    writeData(hitTrigger) := updatedEntry
+    writeMask := hitTriggerOH
     writeValid := true.B
   }
 
@@ -366,9 +308,8 @@ class EPIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
 }
 
 /** Priority-based prefetch queue. Dequeues the entry with the highest urgency
-  * (lowest numerical priority) first, breaking ties by confidence then by
-  * address. This ensures the most time-critical FEC misses are issued to the
-  * cache before less urgent ones.
+  * (lowest numerical priority) first, ensuring the most time-critical FEC
+  * misses are issued to the cache before less urgent ones.
   */
 class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
     extends ICacheModule {
@@ -386,28 +327,14 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
 
   // Use MUX to avoid the combinational loop from Wire self-indexing
   private val deqIdx: UInt = {
-    var bestIdx: UInt = 0.U(log2Ceil(queueSize).W)
+    var bestIdx: UInt      = 0.U(log2Ceil(queueSize).W)
     var bestPriority: UInt = entries(0).priority
-    var bestConfidence: UInt = entries(0).confidence
-    var bestBlkPaddr: UInt = entries(0).blkPaddr
-    var bestValid: Bool = valids(0)
+    var bestValid: Bool    = valids(0)
     for (i <- 1 until queueSize) {
-      val isBetter = valids(i) && (
-        !bestValid ||
-          (entries(i).priority < bestPriority) ||
-          (entries(i).priority === bestPriority && entries(
-            i
-          ).confidence > bestConfidence) ||
-          (entries(i).priority === bestPriority && entries(
-            i
-          ).confidence === bestConfidence &&
-            entries(i).blkPaddr < bestBlkPaddr)
-      )
-      bestIdx = Mux(isBetter, i.U(log2Ceil(queueSize).W), bestIdx)
+      val isBetter = valids(i) && (!bestValid || entries(i).priority < bestPriority)
+      bestIdx      = Mux(isBetter, i.U(log2Ceil(queueSize).W), bestIdx)
       bestPriority = Mux(isBetter, entries(i).priority, bestPriority)
-      bestConfidence = Mux(isBetter, entries(i).confidence, bestConfidence)
-      bestBlkPaddr = Mux(isBetter, entries(i).blkPaddr, bestBlkPaddr)
-      bestValid = Mux(isBetter, valids(i), bestValid)
+      bestValid    = Mux(isBetter, valids(i), bestValid)
     }
     bestIdx
   }
@@ -496,9 +423,6 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
     extends ICacheModule {
   val io: EPIPControllerIO = IO(new EPIPControllerIO(params))
 
-  private val expandedTargetsPerGroup = 5
-  private val maxExpandedTargets =
-    params.numTargetsPerEntry * expandedTargetsPerGroup
   // 12 bc Log2Ceil(64B block / 4B word) = block offset bits
   private val pageBlockBits = 12 - blockOffBits
 
@@ -509,10 +433,6 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   private def pageTag(blkAddr: UInt): UInt =
     if (pageBlockBits > 0) blkAddr(blkAddr.getWidth - 1, pageBlockBits)
     else blkAddr
-
-  // wrap to avoid exceeding the maximum vSetIdx
-  private def incrementVSetIdx(base: UInt, delta: Int): UInt =
-    ((base + delta.U)(idxBits - 1, 0)).asUInt
 
   private def classifyPriority(distance: UInt): UInt =
     Mux(
@@ -663,100 +583,60 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   epipTable.io.allocate.bits.target.valid := true.B
   epipTable.io.allocate.bits.target.blkPaddr := io.fecLine.bits.blkPaddr
   epipTable.io.allocate.bits.target.vSetIdx := io.fecLine.bits.vSetIdx
-  epipTable.io.allocate.bits.target.compactMask := 0.U
-  epipTable.io.allocate.bits.target.confidence := 2.U
   epipTable.io.allocate.bits.target.priority := effectiveLearnPriority
 
   private val targetsValid = epipTable.io.lookup.resp.valid
   private val targets = epipTable.io.lookup.resp.bits
 
   // -----------------------------------------------------------------------
-  // Expand each target group into up to 5 issue entries
-  // (base block + up to 4 compact-mask successors).
-  // Apply adaptive remapping at issue time so that priority changes take
-  // effect immediately for all entries already in the table.
+  // Issue the 2 stored targets directly, applying adaptive remapping.
   // -----------------------------------------------------------------------
-  private val expandedValidVec = Wire(Vec(maxExpandedTargets, Bool()))
-  private val expandedEntries = Wire(
-    Vec(maxExpandedTargets, new EPIPIssueEntry)
-  )
-  expandedValidVec := VecInit(Seq.fill(maxExpandedTargets)(false.B))
-  expandedEntries := VecInit(
-    Seq.fill(maxExpandedTargets)(0.U.asTypeOf(new EPIPIssueEntry))
-  )
+  private val candidateValidVec = Wire(Vec(params.numTargetsPerEntry, Bool()))
+  private val candidateEntries  = Wire(Vec(params.numTargetsPerEntry, new EPIPIssueEntry))
 
-  for (groupIdx <- 0 until params.numTargetsPerEntry) {
-    val group = targets(groupIdx)
-    val groupEnabled =
-      group.valid && (group.confidence >= params.minPrefetchConfidence.U)
-    val baseIdx = groupIdx * expandedTargetsPerGroup
-    val issuePriority = remapPriority(group.priority, promoteP1)
-
-    expandedValidVec(baseIdx) := groupEnabled
-    expandedEntries(baseIdx).blkPaddr := group.blkPaddr
-    expandedEntries(baseIdx).vSetIdx := group.vSetIdx
-    expandedEntries(baseIdx).priority := issuePriority
-    expandedEntries(baseIdx).confidence := group.confidence
-
-    for (offset <- 0 until 4) {
-      val slotIdx = baseIdx + offset + 1
-      expandedValidVec(slotIdx) := groupEnabled && group.compactMask(offset)
-      expandedEntries(slotIdx).blkPaddr := group.blkPaddr + (offset + 1).U
-      expandedEntries(slotIdx).vSetIdx := incrementVSetIdx(
-        group.vSetIdx,
-        offset + 1
-      )
-      expandedEntries(slotIdx).priority := issuePriority
-      expandedEntries(slotIdx).confidence := group.confidence
-    }
+  for (i <- 0 until params.numTargetsPerEntry) {
+    val t = targets(i)
+    candidateValidVec(i)         := t.valid
+    candidateEntries(i).blkPaddr := t.blkPaddr
+    candidateEntries(i).vSetIdx  := t.vSetIdx
+    candidateEntries(i).priority := remapPriority(t.priority, promoteP1)
   }
 
-  private val issueEntries = Reg(Vec(maxExpandedTargets, new EPIPIssueEntry))
-  private val issueValids = RegInit(0.U(maxExpandedTargets.W))
-  private val issueBusy = issueValids.orR
-  private val expandedValidMask = expandedValidVec.asUInt
+  private val candidateValidMask = candidateValidVec.asUInt
 
-  when(targetsValid && expandedValidMask.orR && !issueBusy) {
-    issueEntries := expandedEntries
-    issueValids := expandedValidMask
+  private val issueEntries = Reg(Vec(params.numTargetsPerEntry, new EPIPIssueEntry))
+  private val issueValids  = RegInit(0.U(params.numTargetsPerEntry.W))
+  private val issueBusy    = issueValids.orR
+
+  when(targetsValid && candidateValidMask.orR && !issueBusy) {
+    issueEntries := candidateEntries
+    issueValids  := candidateValidMask
   }
   when(io.flush) { issueValids := 0.U }
 
   // Use MUX to avoid the combinational loop from Wire self-indexing
   private val issueSel: UInt = {
-    var bestIdx: UInt = 0.U(log2Ceil(maxExpandedTargets).W)
+    var bestIdx: UInt      = 0.U(log2Ceil(params.numTargetsPerEntry).W)
     var bestPriority: UInt = issueEntries(0).priority
-    var bestConfidence: UInt = issueEntries(0).confidence
-    var bestBlkPaddr: UInt = issueEntries(0).blkPaddr
-    var bestValid: Bool = issueValids(0)
-    for (i <- 1 until maxExpandedTargets) {
-      val isBetter = issueValids(i) && (
-        !bestValid ||
-          (issueEntries(i).priority < bestPriority) ||
-          (issueEntries(i).priority === bestPriority &&
-            issueEntries(i).confidence > bestConfidence) ||
-          (issueEntries(i).priority === bestPriority &&
-            issueEntries(i).confidence === bestConfidence &&
-            issueEntries(i).blkPaddr < bestBlkPaddr)
-      )
-      bestIdx = Mux(isBetter, i.U(log2Ceil(maxExpandedTargets).W), bestIdx)
+    var bestValid: Bool    = issueValids(0)
+    for (i <- 1 until params.numTargetsPerEntry) {
+      val isBetter = issueValids(i) && (!bestValid || issueEntries(i).priority < bestPriority)
+      bestIdx      = Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
       bestPriority = Mux(isBetter, issueEntries(i).priority, bestPriority)
-      bestConfidence = Mux(isBetter, issueEntries(i).confidence, bestConfidence)
-      bestBlkPaddr = Mux(isBetter, issueEntries(i).blkPaddr, bestBlkPaddr)
-      bestValid = Mux(isBetter, issueValids(i), bestValid)
+      bestValid    = Mux(isBetter, issueValids(i), bestValid)
     }
     bestIdx
   }
 
   private val issueCanSend = issueValids.orR && active
   prefetchQueue.io.enq.valid := issueCanSend && !io.dropDupWithFtq
-  prefetchQueue.io.enq.bits := issueEntries(issueSel)
+  prefetchQueue.io.enq.bits  := issueEntries(issueSel)
 
   when(prefetchQueue.io.enq.fire) {
-    issueValids := issueValids & ~UIntToOH(issueSel, maxExpandedTargets)
+    issueValids := issueValids & ~UIntToOH(issueSel, params.numTargetsPerEntry)
   }
   when(issueCanSend && io.dropDupWithFtq) {
-    issueValids := issueValids & ~UIntToOH(issueSel, maxExpandedTargets)
+    issueValids := issueValids & ~UIntToOH(issueSel, params.numTargetsPerEntry)
   }
 
   io.prefetchVaddr <> prefetchQueue.io.deq
@@ -843,7 +723,7 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   }
   when(targetsValid) {
     printf(
-      p"[EPIP] tableHit issueBusy=${issueBusy} expandedValid=${expandedValidMask.orR}\n"
+      p"[EPIP] tableHit issueBusy=${issueBusy} candidateValid=${candidateValidMask.orR}\n"
     )
   }
   when(issueCanSend) {
