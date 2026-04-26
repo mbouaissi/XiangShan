@@ -99,7 +99,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   val io: EPIPTableIO = IO(new EPIPTableIO(params))
 
   private val zeroTarget = 0.U.asTypeOf(new EPIPTarget)
-  private val zeroTargets =
+  private val nothing =
     VecInit(Seq.fill(params.numTargetsPerEntry)(zeroTarget))
   private val zeroEntry = 0.U.asTypeOf(
     new EPIPTableEntry(params.numTargetsPerEntry, params.lfuCounterBits)
@@ -160,34 +160,8 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       newBlkPaddr <= (target.blkPaddr + 4.U)
 
   // Saturating increment for the LFU counter.
-  private def bumpLfu(count: UInt): UInt =
+  private def increaseLFU(count: UInt): UInt =
     Mux(count.andR, count, count + 1.U)
-
-  // Priority-Based Eviction for candidates:
-  // A candidate is a "better victim" (should be evicted sooner) when it has
-  // a higher numerical priority value (= lower urgency).  On a tie, prefer
-  // the one with lower confidence.
-  private def betterVictimTarget(
-      candidate: EPIPTarget,
-      current: EPIPTarget
-  ): Bool =
-    !current.valid ||
-      (candidate.valid && (
-        (candidate.priority > current.priority) ||
-          (candidate.priority === current.priority && candidate.confidence < current.confidence)
-      ))
-
-  // LFU-Based Victim Selection for table entries:
-  // Evict the entry with the lowest access-frequency count.
-  private def betterVictimWay(
-      candidate: EPIPTableEntry,
-      current: EPIPTableEntry
-  ): Bool =
-    !current.valid ||
-      (candidate.valid && (
-        (candidate.lfuCount < current.lfuCount) ||
-          (candidate.lfuCount === current.lfuCount && candidate.trigger < current.trigger)
-      ))
 
   // Use MUX to avoid the combinational loop from Wire self-indexing
   private def selectTargetVictim(targets: Vec[EPIPTarget]): UInt = {
@@ -242,7 +216,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   private val hit = matchWay.orR
 
   io.lookup.resp.valid := s1DoLookup && hit
-  io.lookup.resp.bits := Mux(hit, readSet(hitWay).targets, zeroTargets)
+  io.lookup.resp.bits := Mux(hit, readSet(hitWay).targets, nothing)
 
   private val writeData = Wire(
     Vec(
@@ -263,17 +237,16 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
 
     when(existingWayOH.orR) {
       val existingWay = PriorityEncoder(existingWayOH)
-      val existingEntry = readSet(existingWay)
-      val updatedEntry = WireInit(existingEntry)
-      val targetSlots = existingEntry.targets
+      val updatedEntry = WireInit(readSet(existingWay))
+      val targetSlots = readSet(existingWay).targets
 
-      updatedEntry.lfuCount := bumpLfu(existingEntry.lfuCount)
+      updatedEntry.lfuCount := increaseLFU(readSet(existingWay).lfuCount)
 
-      // Check whether the new target is already represented (exact or compacted).
-      val existingTargetOH = VecInit(targetSlots.map(t => {
-        val offset = compactableOffset(t, s1AllocTarget.blkPaddr)
-        (t.valid && t.blkPaddr === s1AllocTarget.blkPaddr) ||
-        (canCompact(t, s1AllocTarget.blkPaddr) && t.compactMask(offset(1, 0)))
+      //Is target present?
+      val existingTargetOH = VecInit(targetSlots.map(target => {
+        val offset = compactableOffset(target, s1AllocTarget.blkPaddr)
+        (target.valid && target.blkPaddr === s1AllocTarget.blkPaddr) ||
+        (canCompact(target, s1AllocTarget.blkPaddr) && target.compactMask(offset(1, 0)))
       })).asUInt
       val targetCanCompactOH = VecInit(
         targetSlots.map(t => canCompact(t, s1AllocTarget.blkPaddr))
@@ -281,8 +254,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       val invalidTargetOH = VecInit(targetSlots.map(t => !t.valid)).asUInt
 
       when(existingTargetOH.orR) {
-        // Target already covered: strengthen confidence and keep the higher
-        // priority (lower numerical) priority.
+        //Increase the confidence of the existing target
         val idx = PriorityEncoder(existingTargetOH)
         updatedEntry.targets(idx).confidence :=
           Mux(
@@ -297,7 +269,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
             targetSlots(idx).priority
           )
       }.elsewhen(targetCanCompactOH.orR) {
-        // Compact new block into an existing target's mask.
+        // CCompact the new target into the first eligible slot
         val compactIdx = PriorityEncoder(targetCanCompactOH)
         val compactOffset =
           compactableOffset(targetSlots(compactIdx), s1AllocTarget.blkPaddr)
@@ -316,8 +288,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
             targetSlots(compactIdx).priority
           )
       }.otherwise {
-        // Priority-Based Eviction: replace the least-urgent (highest numerical
-        // priority) candidate, or fill an empty slot if one exists.
+        // Allocate the new target into either an invalid slot or the victim slot
         val replaceIdx = Mux(
           invalidTargetOH.orR,
           PriorityEncoder(invalidTargetOH),
@@ -332,7 +303,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       writeValid := true.B
 
     }.otherwise {
-      // ---- New trigger: allocate a fresh entry via LFU victim selection ----
+      // No existing entry for this trigger; allocate a new one
       val invalidWayOH = VecInit(readSet.map(entry => !entry.valid)).asUInt
       val replaceWay = Mux(
         invalidWayOH.orR,
@@ -345,7 +316,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       newEntry.valid := true.B
       newEntry.trigger := s1AllocTrigger
       newEntry.lfuCount := 1.U // First training event for this trigger
-      newEntry.targets := zeroTargets
+      newEntry.targets := nothing
       newEntry.targets(0) := s1AllocTarget
       newEntry.targets(0).valid := true.B
       writeData(replaceWay) := newEntry
@@ -354,9 +325,9 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     }
 
   }.elsewhen(s1DoLookup && hit) {
-    // LFU "Update on Hit": bump frequency on every successful trigger lookup.
+    // Bump for LFU
     val updatedEntry = WireInit(readSet(hitWay))
-    updatedEntry.lfuCount := bumpLfu(readSet(hitWay).lfuCount)
+    updatedEntry.lfuCount := increaseLFU(readSet(hitWay).lfuCount)
     writeData(hitWay) := updatedEntry
     writeMask := hitWayOH
     writeValid := true.B
@@ -407,12 +378,6 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
     VecInit(Seq.fill(queueSize)(0.U.asTypeOf(new EPIPIssueEntry)))
   )
   private val valids = RegInit(0.U(queueSize.W))
-
-  private def betterDeq(lhs: EPIPIssueEntry, rhs: EPIPIssueEntry): Bool =
-    (lhs.priority < rhs.priority) ||
-      (lhs.priority === rhs.priority && lhs.confidence > rhs.confidence) ||
-      (lhs.priority === rhs.priority && lhs.confidence === rhs.confidence &&
-        lhs.blkPaddr < rhs.blkPaddr)
 
   private val invalidMask = (~valids)(queueSize - 1, 0)
   private val empty = !valids.orR
@@ -569,12 +534,6 @@ class EPIPController(params: EPIPParams)(implicit p: Parameters)
   // -----------------------------------------------------------------------
   private def remapPriority(priority: UInt, promoteP1: Bool): UInt =
     Mux(promoteP1 && priority === EPIPPriority.p1, EPIPPriority.p0, priority)
-
-  private def betterIssue(lhs: EPIPIssueEntry, rhs: EPIPIssueEntry): Bool =
-    (lhs.priority < rhs.priority) ||
-      (lhs.priority === rhs.priority && lhs.confidence > rhs.confidence) ||
-      (lhs.priority === rhs.priority && lhs.confidence === rhs.confidence &&
-        lhs.blkPaddr < rhs.blkPaddr)
 
   private val epipTable = Module(new EPIPTable(params))
   private val prefetchQueue = Module(
