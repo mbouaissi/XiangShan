@@ -240,6 +240,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule
 
   val s1_req_vaddr   = RegEnable(s0_final_vaddr, s0_fire)
   val s1_req_vsetIdx = RegEnable(s0_final_vsetIdx, s0_fire)
+  val s1_ftq_idx     = RegEnable(fromFtq.bits.ftqIdx, s0_fire)
   val s1_only_first  = RegEnable(s0_final_only_first, s0_fire)
   val s1_double_line = RegEnable(s0_final_double_line, s0_fire)
 
@@ -453,6 +454,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule
   // val mmio = fromPMP.map(port => port.mmio) // TODO: handle it
   val (s2_req_paddr , s2_req_vaddr) = (RegEnable(s1_req_paddr, s1_fire), RegEnable(s1_req_vaddr, s1_fire))
   val s2_req_vsetIdx          = RegEnable(s1_req_vsetIdx,       s1_fire)
+  val s2_ftq_idx              = RegEnable(s1_ftq_idx,           s1_fire)
   val s2_req_ptags            = RegEnable(s1_req_ptags,         s1_fire)
   val s2_only_first           = RegEnable(s1_only_first,        s1_fire)
   val s2_double_line          = RegEnable(s1_double_line,       s1_fire)
@@ -720,6 +722,7 @@ class ICacheMainPipe(implicit p: Parameters) extends ICacheModule
     toMSHR(i).bits.paddr    := s2_req_paddr(i)
     toMSHR(i).bits.vaddr    := s2_req_vaddr(i)
     toMSHR(i).bits.waymask  := s2_waymask(i)
+    toMSHR(i).bits.ftqIdx   := s2_ftq_idx
 
 
     when(toMSHR(i).fire && missStateQueue(i) === m_invalid){

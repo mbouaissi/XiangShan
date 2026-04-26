@@ -562,6 +562,7 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
 {
   val hartId = Input(UInt(8.W))
   val prefetch    = Flipped(new FtqPrefechBundle)
+  val rob_commits = Input(Vec(CommitWidth, Valid(new RobCommitInfo)))
   val stop        = Input(Bool())
   val fetch       = new ICacheMainPipeBundle
   val toIFU       = Output(Bool())
@@ -573,9 +574,11 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
   val csr         = new L1CacheToCsrIO
   /* CSR control signal */
   val csr_pf_enable     = Input(Bool())
+  val csr_epip_enable   = Input(Bool())
   val csr_parity_enable = Input(Bool())
   val fencei            = Input(Bool())
   val backend_redirect  = Input(Bool())
+  val epip_redirect     = Input(Valid(new BranchPredictionRedirect))
 }
 
 class ICache()(implicit p: Parameters) extends LazyModule with HasICacheParameters {
@@ -618,10 +621,11 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   val mainPipe          = Module(new ICacheMainPipe)
   val missUnit          = Module(new ICacheMissUnit(edge))
   val fdipPrefetch      = Module(new FDIPPrefetch(edge))
+  val fecTracker        = Module(new FECTracker())
+  val epipController    = Module(new EPIPController(EPIPParams()))
 
   fdipPrefetch.io.hartId              := io.hartId
   fdipPrefetch.io.fencei              := io.fencei
-  fdipPrefetch.io.ftqReq              <> io.prefetch
   fdipPrefetch.io.metaReadReq         <> prefetchMetaArray.io.read
   fdipPrefetch.io.metaReadResp        <> prefetchMetaArray.io.readResp
   fdipPrefetch.io.ICacheMissUnitInfo  <> missUnit.io.ICacheMissUnitInfo
@@ -631,6 +635,111 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   fdipPrefetch.io.PIQRead             <> mainPipe.io.PIQRead
   fdipPrefetch.io.metaWrite           <> DontCare
   fdipPrefetch.io.dataWrite           <> DontCare
+
+  // Drive FEC tracker using observed miss traffic and coarse pipeline progress signals.
+  private val missReqVec = VecInit(missUnit.io.req.map(_.fire))
+  private val missReqValid = missReqVec.asUInt.orR
+  private val missReqBlkPaddr = Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.paddr),
+    getBlkAddr(missUnit.io.req(1).bits.paddr)
+  )
+  private val missReqVSetIdx = Mux(
+    missReqVec(0),
+    missUnit.io.req(0).bits.getVirSetIdx,
+    missUnit.io.req(1).bits.getVirSetIdx
+  )
+
+  private val fetchTriggerReqValid = io.fetch.req.fire && io.fetch.req.bits.readValid.asUInt.orR
+  private val fetchTriggerVaddr = PriorityMux(
+    io.fetch.req.bits.readValid.zip(io.fetch.req.bits.pcMemRead.map(_.startAddr))
+  )
+  private val fetchTriggerBlkAddr = getBlkAddr(fetchTriggerVaddr)
+  private val redirectTriggerBlkAddr = getBlkAddr(io.epip_redirect.bits.cfiUpdate.pc)
+  private val redirectMatchesFetch =
+    io.epip_redirect.valid && fetchTriggerReqValid &&
+      redirectTriggerBlkAddr === fetchTriggerBlkAddr
+
+  private val lastMissValid = RegInit(false.B)
+  private val lastMissFtqIdx = RegInit(0.U.asTypeOf(new FtqPtr))
+  when(io.fencei) {
+    lastMissValid := false.B
+  }.elsewhen(missReqValid) {
+    lastMissValid := true.B
+    lastMissFtqIdx := Mux(
+      missReqVec(0),
+      missUnit.io.req(0).bits.ftqIdx,
+      missUnit.io.req(1).bits.ftqIdx
+    )
+  }
+
+  fecTracker.io.newMiss.valid := missReqValid
+  fecTracker.io.newMiss.bits.blkPaddr := missReqBlkPaddr
+  fecTracker.io.newMiss.bits.blkVaddr := Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.vaddr),
+    getBlkAddr(missUnit.io.req(1).bits.vaddr)
+  )
+  fecTracker.io.newMiss.bits.vSetIdx := missReqVSetIdx
+  fecTracker.io.newMiss.bits.ftqIdx := Mux(
+    missReqVec(0),
+    missUnit.io.req(0).bits.ftqIdx,
+    missUnit.io.req(1).bits.ftqIdx
+  )
+  fecTracker.io.stallUpdate.valid := io.stop && lastMissValid
+  fecTracker.io.stallUpdate.bits.ftqIdx := lastMissFtqIdx
+  fecTracker.io.stallUpdate.bits.stalled := true.B
+  for (w <- 0 until CommitWidth) {
+    fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
+    fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
+  }
+  // Use the BPU's current fetch PC as the PDIP trigger, not the miss address.
+  // This gives the semantically correct "A → B" association: "when fetching A
+  // (the trigger), prefetch B (the FEC miss)".  RegEnable holds the last valid
+  // value so the trigger is well-defined even when no new fetch fires in the
+  // same cycle as a miss.
+  private val triggerForFEC = RegEnable(fetchTriggerBlkAddr, fetchTriggerReqValid)
+  fecTracker.io.triggerAddr := triggerForFEC
+  fecTracker.io.fencei := io.fencei
+
+  // Wire EPIP controller and merge EPIP-generated requests with FTQ prefetch stream.
+  val ftqPrefetchBlkAddr = getBlkAddr(io.prefetch.req.bits.target)
+  val epipReqTargetVaddr = Cat(
+    epipController.io.prefetchVaddr.bits.blkPaddr,
+    0.U(blockOffBits.W)
+  )
+  val epipDupWithFtq =
+    epipController.io.prefetchVaddr.valid &&
+    io.prefetch.req.valid &&
+    (epipController.io.prefetchVaddr.bits.blkPaddr === ftqPrefetchBlkAddr)
+
+  epipController.io.trigger.valid := fetchTriggerReqValid
+  epipController.io.trigger.bits.blkPaddr := fetchTriggerBlkAddr
+  epipController.io.trigger.bits.highCostHint := redirectMatchesFetch
+  epipController.io.trigger.bits.controlTrigger :=
+    redirectMatchesFetch && io.epip_redirect.bits.ControlRedirectBubble
+  epipController.io.trigger.bits.btbMissTrigger :=
+    redirectMatchesFetch &&
+      (io.epip_redirect.bits.ControlBTBMissBubble || io.epip_redirect.bits.BTBMissBubble)
+  epipController.io.fecLine <> fecTracker.io.fecLine
+  epipController.io.mshrThresholdMet := missUnit.io.req.map(_.ready).reduce(_ && _)
+  epipController.io.flush := io.fencei
+  epipController.io.enable := io.csr_pf_enable && io.csr_epip_enable
+  epipController.io.dropDupWithFtq := epipDupWithFtq
+
+  val useFtqPrefetch = io.prefetch.req.valid
+  val useEpipPrefetch = !useFtqPrefetch && epipController.io.prefetchVaddr.valid
+  val fdipPrefetchReady = fdipPrefetch.io.ftqReq.req.ready
+
+  fdipPrefetch.io.ftqReq.req.valid := useFtqPrefetch || useEpipPrefetch
+  fdipPrefetch.io.ftqReq.req.bits.target := Mux(
+    useFtqPrefetch,
+    io.prefetch.req.bits.target,
+    epipReqTargetVaddr
+  )
+
+  io.prefetch.req.ready := useFtqPrefetch && fdipPrefetchReady
+  epipController.io.prefetchVaddr.ready := useEpipPrefetch && fdipPrefetchReady
 
   // Meta Array. Priority: missUnit > fdipPrefetch
   if (prefetchToL1) {
