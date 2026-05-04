@@ -66,6 +66,11 @@ class EPIPIssueEntry(implicit p: Parameters) extends ICacheBundle {
   val priority: UInt = UInt(EPIPPriority.width.W)
 }
 
+class EPIPPrefetchEntry(implicit p: Parameters) extends ICacheBundle {
+  val blkPaddr = UInt((PAddrBits - blockOffBits).W)
+  val vSetIdx  = UInt(idxBits.W)
+}
+
 class EPIPTableIO(params: EPIPParams)(implicit p: Parameters)
     extends ICacheBundle {
   val lookup = new Bundle {
@@ -298,7 +303,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
 class EPIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
     extends ICacheBundle {
   val enq = Flipped(DecoupledIO(new EPIPIssueEntry))
-  val deq = DecoupledIO(new PrefetchEntry)
+  val deq = DecoupledIO(new EPIPPrefetchEntry)
   val flush = Input(Bool())
   val mshrThresholdMet = Input(Bool())
   val empty = Output(Bool())
@@ -377,7 +382,7 @@ class EPIPControllerIO(params: EPIPParams)(implicit p: Parameters)
     val starvationDistance = UInt(16.W)
   }))
 
-  val prefetchVaddr = DecoupledIO(new PrefetchEntry)
+  val prefetchVaddr = DecoupledIO(new EPIPPrefetchEntry)
   val mshrThresholdMet = Input(Bool())
   val flush = Input(Bool())
   val enable = Input(Bool())
