@@ -803,17 +803,16 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   private val pdipFtqReqBits = Wire(new PrefetchRequest)
   pdipFtqReqBits.target := Cat(pdipS1Bits.blkPaddr, 0.U(blockOffBits.W))
 
-  // RR arbiter PDIP gets equal priority to FTQ prefetches
-  private val prefetchArb = Module(new RRArbiter(new PrefetchRequest, 2))
-  prefetchArb.io.in(0).valid := io.prefetch.req.valid
-  prefetchArb.io.in(0).bits  := io.prefetch.req.bits
-  prefetchArb.io.in(1).valid := pdipIssueValid
-  prefetchArb.io.in(1).bits  := pdipFtqReqBits
+  // FDIP (FTQ) has strict priority over PDIP; PDIP only fires when FTQ has nothing
+  private val useFtqPrefetch    = io.prefetch.req.valid
+  private val usePdipPrefetch   = !useFtqPrefetch && pdipIssueValid
+  private val fdipPrefetchReady = fdipPrefetch.io.ftqReq.req.ready
 
-  fdipPrefetch.io.ftqReq.req <> prefetchArb.io.out
-  io.prefetch.req.ready      := prefetchArb.io.in(0).ready
+  fdipPrefetch.io.ftqReq.req.valid       := useFtqPrefetch || usePdipPrefetch
+  fdipPrefetch.io.ftqReq.req.bits.target := Mux(useFtqPrefetch, io.prefetch.req.bits.target, pdipFtqReqBits.target)
+  io.prefetch.req.ready                  := useFtqPrefetch && fdipPrefetchReady
 
-  when(prefetchArb.io.in(1).fire) { pdipS1Valid := false.B }
+  when(usePdipPrefetch && fdipPrefetchReady) { pdipS1Valid := false.B }
 
   pdipController.io.trigger.valid               := fetchTriggerReqValid
   pdipController.io.trigger.bits.blkPaddr       := fetchTriggerBlkAddr
