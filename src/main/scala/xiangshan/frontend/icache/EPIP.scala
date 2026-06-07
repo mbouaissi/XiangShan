@@ -310,53 +310,65 @@ class EPIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
   val full = Output(Bool())
 }
 
-/** Priority based prefetch queue. Dequeue only when MSHR threshold is met, 
- * and always issue the candidate with the highest priority. 
-  */
+/** Priority-banked prefetch queue: one circular FIFO per priority level.
+ *  Dequeue always takes from the lowest-numbered non-empty bank.
+ *  Eliminates the N-wide priority scan; cross-bank selection is a 4-wide
+ *  PriorityEncoder which is trivially fast.
+ */
 class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
     extends ICacheModule {
   val io: EPIPPrefetchQueueIO = IO(new EPIPPrefetchQueueIO(queueSize))
 
-  private val entries = RegInit(
-    VecInit(Seq.fill(queueSize)(0.U.asTypeOf(new EPIPIssueEntry)))
-  )
-  private val valids = RegInit(0.U(queueSize.W))
+  private val numBanks  = 4  // one per EPIPPriority level
+  private val bankDepth = queueSize / numBanks
+  require(queueSize % numBanks == 0, s"queueSize ($queueSize) must be divisible by $numBanks")
 
-  private val invalidMask = (~valids)(queueSize - 1, 0)
-  private val empty = !valids.orR
-  private val full = valids.andR
-  private val enqIdx = PriorityEncoder(invalidMask)
+  private val bankEntries = Seq.tabulate(numBanks) { _ =>
+    RegInit(VecInit(Seq.fill(bankDepth)(0.U.asTypeOf(new EPIPPrefetchEntry))))
+  }
+  private val bankHead  = Seq.fill(numBanks)(RegInit(0.U(log2Ceil(bankDepth).W)))
+  private val bankTail  = Seq.fill(numBanks)(RegInit(0.U(log2Ceil(bankDepth).W)))
+  private val bankCount = Seq.fill(numBanks)(RegInit(0.U((log2Ceil(bankDepth) + 1).W)))
 
-  private val deqIdx: UInt = {
-    var bestIdx: UInt      = 0.U(log2Ceil(queueSize).W)
-    var bestPriority: UInt = entries(0).priority
-    var bestValid: Bool    = valids(0)
-    for (i <- 1 until queueSize) {
-      val isBetter = valids(i) && (!bestValid || entries(i).priority < bestPriority)
-      bestIdx      = Mux(isBetter, i.U(log2Ceil(queueSize).W), bestIdx)
-      bestPriority = Mux(isBetter, entries(i).priority, bestPriority)
-      bestValid    = Mux(isBetter, valids(i), bestValid)
+  private val bankNonEmpty = VecInit(bankCount.map(_ =/= 0.U))
+  private val bankFull     = VecInit(bankCount.map(_ === bankDepth.U))
+  private val anyValid     = bankNonEmpty.asUInt.orR
+  // Lowest-numbered non-empty bank = highest priority
+  private val deqBank      = PriorityEncoder(bankNonEmpty.asUInt)
+
+  io.empty     := !anyValid
+  io.full      := bankFull.asUInt.andR
+  io.enq.ready := !bankFull(io.enq.bits.priority)
+  io.deq.valid := anyValid && io.mshrThresholdMet
+  // 4-wide bank select then 10-wide head select — both fast register-driven muxes
+  io.deq.bits  := Mux1H((0 until numBanks).map(b =>
+    (deqBank === b.U) -> bankEntries(b)(bankHead(b))
+  ))
+
+  for (b <- 0 until numBanks) {
+    val doEnq = io.enq.fire && !io.flush && io.enq.bits.priority === b.U
+    val doDeq = io.deq.fire && !io.flush && deqBank === b.U
+
+    when(doEnq) {
+      bankEntries(b)(bankTail(b)).blkPaddr := io.enq.bits.blkPaddr
+      bankEntries(b)(bankTail(b)).vSetIdx  := io.enq.bits.vSetIdx
+      bankTail(b) := Mux(bankTail(b) === (bankDepth - 1).U, 0.U, bankTail(b) + 1.U)
     }
-    bestIdx
+    when(doDeq) {
+      bankHead(b) := Mux(bankHead(b) === (bankDepth - 1).U, 0.U, bankHead(b) + 1.U)
+    }
+    // Handle simultaneous enq+deq to same bank: count unchanged
+    when(doEnq && !doDeq) { bankCount(b) := bankCount(b) + 1.U }
+      .elsewhen(doDeq && !doEnq) { bankCount(b) := bankCount(b) - 1.U }
   }
 
-  io.empty := empty
-  io.full := full
-  io.enq.ready := !full
-  io.deq.valid := !empty && io.mshrThresholdMet
-  io.deq.bits.blkPaddr := entries(deqIdx).blkPaddr
-  io.deq.bits.vSetIdx := entries(deqIdx).vSetIdx
-
-  when(io.enq.fire && !io.flush) {
-    entries(enqIdx) := io.enq.bits
-    valids := valids | UIntToOH(enqIdx, queueSize)
+  when(io.flush) {
+    for (b <- 0 until numBanks) {
+      bankHead(b)  := 0.U
+      bankTail(b)  := 0.U
+      bankCount(b) := 0.U
+    }
   }
-
-  when(io.deq.fire && !io.flush) {
-    valids := valids & ~UIntToOH(deqIdx, queueSize)
-  }
-
-  when(io.flush) { valids := 0.U }
 }
 
 // ---------------------------------------------------------------------------
