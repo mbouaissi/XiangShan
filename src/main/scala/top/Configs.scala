@@ -196,6 +196,12 @@ class MinimalConfig(n: Int = 1) extends Config(
   })
 )
 
+class MinimalILAConfig(n: Int = 1) extends Config(
+  new MinimalConfig(n).alter((site, here, up) => {
+    case SoCParamsKey => up(SoCParamsKey).copy(EnableILA = true)
+  })
+)
+
 // Non-synthesizable MinimalConfig, for fast simulation only
 class MinimalSimConfig(n: Int = 1) extends Config(
   new MinimalConfig(n).alter((site, here, up) => {

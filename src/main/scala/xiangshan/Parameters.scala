@@ -311,6 +311,7 @@ trait HasXSParameter {
   implicit val p: Parameters
 
   val PAddrBits = p(SoCParamsKey).PAddrBits // PAddrBits is Phyical Memory addr bits
+  val enableILA = p(SoCParamsKey).EnableILA
 
   val coreParams = p(XSCoreParamsKey)
   val env = p(DebugOptionsKey)
