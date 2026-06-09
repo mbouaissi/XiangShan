@@ -1077,6 +1077,18 @@ class DCacheImp(outer: DCache) extends LazyModuleImp(outer) with HasDCacheParame
   prefetcherMonitor.io.timely.late_miss_prefetch := missQueue.io.prefetch_info.naive.late_miss_prefetch
   prefetcherMonitor.io.timely.prefetch_hit := PopCount(ldu.map(_.io.prefetch_info.naive.prefetch_hit))
   io.pf_ctrl <> prefetcherMonitor.io.pf_ctrl
+  if (enableILA) {
+    val ila = Module(new ila_prefetch_debug)
+    ila.clk    := clock
+    ila.probe0 := prefetcherMonitor.io.timely.total_prefetch.asUInt
+    ila.probe1 := prefetcherMonitor.io.validity.good_prefetch.asUInt
+    ila.probe2 := prefetcherMonitor.io.validity.bad_prefetch.asUInt
+    ila.probe3 := prefetcherMonitor.io.timely.late_hit_prefetch.asUInt
+    ila.probe4 := prefetcherMonitor.io.timely.late_miss_prefetch.asUInt
+    ila.probe5 := prefetcherMonitor.io.timely.prefetch_hit
+    ila.probe6 := prefetcherMonitor.io.pf_ctrl.enable.asUInt
+    ila.probe7 := VecInit(ldu.map(_.io.miss_req.fire)).asUInt
+  }
   XSPerfAccumulate("useless_prefetch", ldu.map(_.io.prefetch_info.naive.total_prefetch).reduce(_ || _) && !(ldu.map(_.io.prefetch_info.naive.useful_prefetch).reduce(_ || _)))
   XSPerfAccumulate("useful_prefetch", ldu.map(_.io.prefetch_info.naive.useful_prefetch).reduce(_ || _))
   XSPerfAccumulate("late_prefetch_hit", ldu.map(_.io.prefetch_info.naive.late_prefetch_hit).reduce(_ || _))
