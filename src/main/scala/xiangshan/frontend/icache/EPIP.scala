@@ -130,6 +130,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
     }
   }
 
+  // ---- s0: issue read ----
   private val readDoAlloc = io.allocate.valid && !flushActive && !io.flush
   private val readDoLookup =
     io.lookup.req.valid && !readDoAlloc && !flushActive && !io.flush
@@ -137,64 +138,70 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   table.io.r.req.valid := readDoAlloc || readDoLookup
   table.io.r.req.bits.setIdx := Mux(readDoAlloc, allocSetIdx, lookupSetIdx)
 
+  // ---- s1: BRAM access in flight ----
   private val s1DoAlloc = RegNext(readDoAlloc, false.B)
   private val s1DoLookup = RegNext(readDoLookup, false.B)
   private val s1AllocTrigger = RegEnable(io.allocate.bits.trigger, readDoAlloc)
   private val s1AllocTarget = RegEnable(io.allocate.bits.target, readDoAlloc)
   private val s1LookupTrigger =
     RegEnable(io.lookup.req.bits.trigger, readDoLookup)
-  private val readSet = table.io.r.resp.data
 
-  // Saturating increment for the LFU counter.
+  // ---- s1 -> s2: register the BRAM output (cuts the RMW loop in half) ----
+  private val s2ReadSet =
+    RegEnable(table.io.r.resp.data, s1DoAlloc || s1DoLookup)
+  private val s2DoAlloc = RegNext(s1DoAlloc && !io.flush, false.B)
+  private val s2DoLookup = RegNext(s1DoLookup && !io.flush, false.B)
+  private val s2AllocTrigger = RegEnable(s1AllocTrigger, s1DoAlloc)
+  private val s2AllocTarget = RegEnable(s1AllocTarget, s1DoAlloc)
+  private val s2LookupTrigger = RegEnable(s1LookupTrigger, s1DoLookup)
+
   private def increaseLFU(count: UInt): UInt =
     Mux(count.andR, count, count + 1.U)
 
-  // Use MUX to avoid the combinational loop from Wire self-indexing
   private def selectTargetVictim(targets: Vec[EPIPTarget]): UInt = {
-    var bestIdx: UInt      = 0.U(log2Ceil(params.numTargetsPerEntry).W)
+    var bestIdx: UInt = 0.U(log2Ceil(params.numTargetsPerEntry).W)
     var bestPriority: UInt = targets(0).priority
-    var bestValid: Bool    = targets(0).valid
+    var bestValid: Bool = targets(0).valid
     for (i <- 1 until params.numTargetsPerEntry) {
       val isBetter = !bestValid ||
         (targets(i).valid && targets(i).priority > bestPriority)
-      bestIdx      = Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
+      bestIdx = Mux(isBetter, i.U(log2Ceil(params.numTargetsPerEntry).W), bestIdx)
       bestPriority = Mux(isBetter, targets(i).priority, bestPriority)
-      bestValid    = Mux(isBetter, targets(i).valid, bestValid)
+      bestValid = Mux(isBetter, targets(i).valid, bestValid)
     }
     bestIdx
   }
 
-  // Use MUX to avoid the combinational loop from Wire self-indexing
+  // Tournament tree, depth log2(ways). Only used when all ways are valid
+  // (caller checks invalidTriggerOH first), so valid bits are not needed.
+  // Ties resolve to the lower way index — the trigger-address tiebreak is
+  // dropped; it was an arbitrary determinism choice and cost a wide
+  // comparator per chain stage.
   private def selectTriggerVictim(entries: Vec[EPIPTableEntry]): UInt = {
-    var bestIdx: UInt = 0.U(log2Ceil(params.numWaysPerSet).W)
-    var bestLfu: UInt = entries(0).lfuCount
-    var bestTrigger: UInt = entries(0).trigger
-    var bestValid: Bool = entries(0).valid
-    for (i <- 1 until params.numWaysPerSet) {
-      val isBetter = !bestValid ||
-        (entries(i).valid && (
-          (entries(i).lfuCount < bestLfu) ||
-            (entries(i).lfuCount === bestLfu && entries(
-              i
-            ).trigger < bestTrigger)
-        ))
-      bestIdx = Mux(isBetter, i.U(log2Ceil(params.numWaysPerSet).W), bestIdx)
-      bestLfu = Mux(isBetter, entries(i).lfuCount, bestLfu)
-      bestTrigger = Mux(isBetter, entries(i).trigger, bestTrigger)
-      bestValid = Mux(isBetter, entries(i).valid, bestValid)
+    def tournament(cands: Seq[(UInt, UInt)]): (UInt, UInt) = cands match {
+      case Seq(only) => only
+      case _ =>
+        val (l, r) = cands.splitAt(cands.length / 2)
+        val (lIdx, lLfu) = tournament(l)
+        val (rIdx, rLfu) = tournament(r)
+        val takeRight = rLfu < lLfu
+        (Mux(takeRight, rIdx, lIdx), Mux(takeRight, rLfu, lLfu))
     }
-    bestIdx
+    tournament(entries.zipWithIndex.map { case (e, i) =>
+      (i.U(log2Ceil(params.numWaysPerSet).W), e.lfuCount)
+    })._1
   }
 
+  // ---- s2: match / victim / update on REGISTERED data ----
   private val matchTrigger = VecInit(
-    readSet.map(entry => entry.valid && entry.trigger === s1LookupTrigger)
+    s2ReadSet.map(entry => entry.valid && entry.trigger === s2LookupTrigger)
   ).asUInt
   private val hitTrigger = PriorityEncoder(matchTrigger)
   private val hitTriggerOH = PriorityEncoderOH(matchTrigger)
   private val hit = matchTrigger.orR
 
-  io.lookup.resp.valid := s1DoLookup && hit
-  io.lookup.resp.bits := Mux(hit, readSet(hitTrigger).targets, nothing)
+  io.lookup.resp.valid := s2DoLookup && hit
+  io.lookup.resp.bits := Mux(hit, s2ReadSet(hitTrigger).targets, nothing)
 
   private val writeData = Wire(
     Vec(
@@ -204,33 +211,33 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
   )
   private val writeMask = Wire(UInt(params.numWaysPerSet.W))
   private val writeValid = Wire(Bool())
-  writeData := readSet
+  writeData := s2ReadSet
   writeMask := 0.U
   writeValid := false.B
 
-  when(s1DoAlloc) {
+  when(s2DoAlloc) {
     val existingTriggerOH = VecInit(
-      readSet.map(entry => entry.valid && entry.trigger === s1AllocTrigger)
+      s2ReadSet.map(entry => entry.valid && entry.trigger === s2AllocTrigger)
     ).asUInt
 
     when(existingTriggerOH.orR) {
       val existingTrigger = PriorityEncoder(existingTriggerOH)
-      val updatedEntry = WireInit(readSet(existingTrigger))
-      val targetSlots = readSet(existingTrigger).targets
+      val updatedEntry = WireInit(s2ReadSet(existingTrigger))
+      val targetSlots = s2ReadSet(existingTrigger).targets
 
-      updatedEntry.lfuCount := increaseLFU(readSet(existingTrigger).lfuCount)
+      updatedEntry.lfuCount := increaseLFU(s2ReadSet(existingTrigger).lfuCount)
 
       val existingTargetOH = VecInit(
-        targetSlots.map(target => target.valid && target.blkPaddr === s1AllocTarget.blkPaddr)
+        targetSlots.map(t => t.valid && t.blkPaddr === s2AllocTarget.blkPaddr)
       ).asUInt
-      val invalidTargetOH = VecInit(targetSlots.map(target => !target.valid)).asUInt
+      val invalidTargetOH = VecInit(targetSlots.map(t => !t.valid)).asUInt
 
       when(existingTargetOH.orR) {
         val idx = PriorityEncoder(existingTargetOH)
         updatedEntry.targets(idx).priority :=
           Mux(
-            s1AllocTarget.priority < targetSlots(idx).priority,
-            s1AllocTarget.priority,
+            s2AllocTarget.priority < targetSlots(idx).priority,
+            s2AllocTarget.priority,
             targetSlots(idx).priority
           )
       }.otherwise {
@@ -239,7 +246,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
           PriorityEncoder(invalidTargetOH),
           selectTargetVictim(targetSlots)
         )
-        updatedEntry.targets(replaceIdx) := s1AllocTarget
+        updatedEntry.targets(replaceIdx) := s2AllocTarget
         updatedEntry.targets(replaceIdx).valid := true.B
       }
 
@@ -248,40 +255,36 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       writeValid := true.B
 
     }.otherwise {
-      // No existing entry for this trigger; allocate a new one
-      val invalidTriggerOH = VecInit(readSet.map(entry => !entry.valid)).asUInt
+      val invalidTriggerOH = VecInit(s2ReadSet.map(e => !e.valid)).asUInt
       val replaceTrigger = Mux(
         invalidTriggerOH.orR,
         PriorityEncoder(invalidTriggerOH),
-        selectTriggerVictim(readSet)
+        selectTriggerVictim(s2ReadSet)
       )
       val newEntry = Wire(
         new EPIPTableEntry(params.numTargetsPerEntry, params.lfuCounterBits)
       )
       newEntry.valid := true.B
-      newEntry.trigger := s1AllocTrigger
-      newEntry.lfuCount := 1.U 
+      newEntry.trigger := s2AllocTrigger
+      newEntry.lfuCount := 1.U
       newEntry.targets := nothing
-      newEntry.targets(0) := s1AllocTarget
+      newEntry.targets(0) := s2AllocTarget
       newEntry.targets(0).valid := true.B
       writeData(replaceTrigger) := newEntry
       writeMask := UIntToOH(replaceTrigger, params.numWaysPerSet)
       writeValid := true.B
     }
 
-  }.elsewhen(s1DoLookup && hit) {
-    // Bump for LFU
-    val updatedEntry = WireInit(readSet(hitTrigger))
-    updatedEntry.lfuCount := increaseLFU(readSet(hitTrigger).lfuCount)
+  }.elsewhen(s2DoLookup && hit) {
+    val updatedEntry = WireInit(s2ReadSet(hitTrigger))
+    updatedEntry.lfuCount := increaseLFU(s2ReadSet(hitTrigger).lfuCount)
     writeData(hitTrigger) := updatedEntry
     writeMask := hitTriggerOH
     writeValid := true.B
   }
 
   private val flushWriteValid = flushActive
-  private val flushWriteData = VecInit(
-    Seq.fill(params.numWaysPerSet)(zeroEntry)
-  )
+  private val flushWriteData = VecInit(Seq.fill(params.numWaysPerSet)(zeroEntry))
   private val flushWriteMask = Fill(params.numWaysPerSet, 1.U(1.W))
 
   table.io.w.req.valid := flushWriteValid || writeValid
@@ -291,14 +294,15 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       flushWriteValid,
       flushSetIdx,
       Mux(
-        s1DoAlloc,
-        s1AllocTrigger(setIdxBits - 1, 0),
-        s1LookupTrigger(setIdxBits - 1, 0)
+        s2DoAlloc,
+        s2AllocTrigger(setIdxBits - 1, 0),
+        s2LookupTrigger(setIdxBits - 1, 0)
       )
     ),
     waymask = Mux(flushWriteValid, flushWriteMask, writeMask)
   )
 }
+
 
 class EPIPPrefetchQueueIO(queueSize: Int)(implicit p: Parameters)
     extends ICacheBundle {
@@ -319,7 +323,7 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
     extends ICacheModule {
   val io: EPIPPrefetchQueueIO = IO(new EPIPPrefetchQueueIO(queueSize))
 
-  private val numBanks  = 4  // one per EPIPPriority level
+  private val numBanks  = 4
   private val bankDepth = queueSize / numBanks
   require(queueSize % numBanks == 0, s"queueSize ($queueSize) must be divisible by $numBanks")
 
@@ -333,21 +337,38 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
   private val bankNonEmpty = VecInit(bankCount.map(_ =/= 0.U))
   private val bankFull     = VecInit(bankCount.map(_ === bankDepth.U))
   private val anyValid     = bankNonEmpty.asUInt.orR
-  // Lowest-numbered non-empty bank = highest priority
   private val deqBank      = PriorityEncoder(bankNonEmpty.asUInt)
 
-  io.empty     := !anyValid
-  io.full      := bankFull.asUInt.andR
-  io.enq.ready := !bankFull(io.enq.bits.priority)
-  io.deq.valid := anyValid && io.mshrThresholdMet
-  // 4-wide bank select then 10-wide head select — both fast register-driven muxes
-  io.deq.bits  := Mux1H((0 until numBanks).map(b =>
+  // -------------------------------------------------------------------
+  // Output register stage: deq.bits is driven directly from a flop.
+  // The head-pointer mux chain now terminates here instead of feeding
+  // downstream logic combinationally.
+  // -------------------------------------------------------------------
+  private val outValid = RegInit(false.B)
+  private val outBits  = Reg(new EPIPPrefetchEntry)
+
+  private val outFree = !outValid || io.deq.fire
+  private val refill  = anyValid && outFree && !io.flush
+
+  private val selBits = Mux1H((0 until numBanks).map(b =>
     (deqBank === b.U) -> bankEntries(b)(bankHead(b))
   ))
 
+  when(refill) { outBits := selBits }
+  when(io.flush)           { outValid := false.B }
+    .elsewhen(refill)      { outValid := true.B }
+    .elsewhen(io.deq.fire) { outValid := false.B }
+
+  io.deq.valid := outValid && io.mshrThresholdMet
+  io.deq.bits  := outBits
+
+  io.empty     := !anyValid && !outValid
+  io.full      := bankFull.asUInt.andR
+  io.enq.ready := !bankFull(io.enq.bits.priority)
+
   for (b <- 0 until numBanks) {
     val doEnq = io.enq.fire && !io.flush && io.enq.bits.priority === b.U
-    val doDeq = io.deq.fire && !io.flush && deqBank === b.U
+    val doDeq = refill && deqBank === b.U   // pop when entry moves into out reg
 
     when(doEnq) {
       bankEntries(b)(bankTail(b)).blkPaddr := io.enq.bits.blkPaddr
@@ -357,8 +378,7 @@ class EPIPPrefetchQueue(queueSize: Int)(implicit p: Parameters)
     when(doDeq) {
       bankHead(b) := Mux(bankHead(b) === (bankDepth - 1).U, 0.U, bankHead(b) + 1.U)
     }
-    // Handle simultaneous enq+deq to same bank: count unchanged
-    when(doEnq && !doDeq) { bankCount(b) := bankCount(b) + 1.U }
+    when(doEnq && !doDeq)      { bankCount(b) := bankCount(b) + 1.U }
       .elsewhen(doDeq && !doEnq) { bankCount(b) := bankCount(b) - 1.U }
   }
 
