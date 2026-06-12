@@ -107,7 +107,7 @@ class EPIPTable(params: EPIPParams)(implicit p: Parameters)
       set = params.numTableSets,
       way = params.numWaysPerSet,
       shouldReset = true,
-      holdRead = false, // s2 register holds the data; the hold mux would block OREG packing
+      holdRead = true,
       singlePort = false
     )
   )
