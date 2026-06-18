@@ -43,7 +43,7 @@ case class ICacheParameters(
     nProbeEntries: Int = 2,
     // fdip default config
     enableICachePrefetch: Boolean = true,
-    prefetchToL1: Boolean = false,
+    prefetchToL1: Boolean = true,
     prefetchPipeNum: Int = 1,
     nPrefetchEntries: Int = 12,
     nPrefBufferEntries: Int = 32,
@@ -562,6 +562,7 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
 {
   val hartId = Input(UInt(8.W))
   val prefetch    = Flipped(new FtqPrefechBundle)
+  val rob_commits = Input(Vec(CommitWidth, Valid(new RobCommitInfo)))
   val stop        = Input(Bool())
   val fetch       = new ICacheMainPipeBundle
   val toIFU       = Output(Bool())
@@ -573,9 +574,11 @@ class ICacheIO(implicit p: Parameters) extends ICacheBundle
   val csr         = new L1CacheToCsrIO
   /* CSR control signal */
   val csr_pf_enable     = Input(Bool())
+  val csr_pdip_enable   = Input(Bool())
   val csr_parity_enable = Input(Bool())
   val fencei            = Input(Bool())
   val backend_redirect  = Input(Bool())
+  val pdip_redirect     = Input(Valid(new BranchPredictionRedirect))
 }
 
 class ICache()(implicit p: Parameters) extends LazyModule with HasICacheParameters {
@@ -618,10 +621,27 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   val mainPipe          = Module(new ICacheMainPipe)
   val missUnit          = Module(new ICacheMissUnit(edge))
   val fdipPrefetch      = Module(new FDIPPrefetch(edge))
+  val fecTracker        = Module(new FECTracker())
+  val pdipController    = Module(new PDIPController(PDIPParams()))
+
+  private val mirrorTagGen = new Bundle {
+    val valid: Bool = Bool()
+    val tag:   UInt = UInt(tagBits.W)
+    val epoch: Bool = Bool()
+  }
+  private val mirrorEpoch = RegInit(false.B)
+  when(io.fencei) { mirrorEpoch := ~mirrorEpoch }
+  private val mirrorTagArray = Module(new SRAMTemplate(
+    mirrorTagGen,
+    set        = ICacheSets,
+    way        = ICacheWays,
+    shouldReset = true,
+    holdRead   = true,
+    singlePort = false
+  ))
 
   fdipPrefetch.io.hartId              := io.hartId
   fdipPrefetch.io.fencei              := io.fencei
-  fdipPrefetch.io.ftqReq              <> io.prefetch
   fdipPrefetch.io.metaReadReq         <> prefetchMetaArray.io.read
   fdipPrefetch.io.metaReadResp        <> prefetchMetaArray.io.readResp
   fdipPrefetch.io.ICacheMissUnitInfo  <> missUnit.io.ICacheMissUnitInfo
@@ -632,22 +652,220 @@ class ICacheImp(outer: ICache) extends LazyModuleImp(outer) with HasICacheParame
   fdipPrefetch.io.metaWrite           <> DontCare
   fdipPrefetch.io.dataWrite           <> DontCare
 
-  // Meta Array. Priority: missUnit > fdipPrefetch
+  // Drive FEC tracker using observed miss traffic and coarse pipeline progress signals.
+  private val missReqVec = VecInit(missUnit.io.req.map(_.fire))
+  private val missReqValid = missReqVec.asUInt.orR
+  private val missReqBlkPaddr = Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.paddr),
+    getBlkAddr(missUnit.io.req(1).bits.paddr)
+  )
+  private val missReqVBlkAddr = Mux(
+    missReqVec(0),
+    getBlkAddr(missUnit.io.req(0).bits.vaddr),
+    getBlkAddr(missUnit.io.req(1).bits.vaddr)
+  )
+  private val missReqVSetIdx = Mux(
+    missReqVec(0),
+    missUnit.io.req(0).bits.getVirSetIdx,
+    missUnit.io.req(1).bits.getVirSetIdx
+  )
+
+  private val fetchTriggerReqValid = io.fetch.req.fire && io.fetch.req.bits.readValid.asUInt.orR
+  private val fetchTriggerVaddr = PriorityMux(
+    io.fetch.req.bits.readValid.zip(io.fetch.req.bits.pcMemRead.map(_.startAddr))
+  )
+  private val fetchTriggerBlkAddr = getBlkAddr(fetchTriggerVaddr)
+  private val redirectTriggerBlkAddr = getBlkAddr(io.pdip_redirect.bits.cfiUpdate.pc)
+  private val redirectMatchesFetch =
+    io.pdip_redirect.valid && fetchTriggerReqValid &&
+      redirectTriggerBlkAddr === fetchTriggerBlkAddr
+
+  private val lastCommittedBranchBlkAddr =
+    RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val pendingRedirectTriggerBlkAddr =
+    RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val pendingRedirectTriggerValid = RegInit(false.B)
+
+  for (w <- 0 until CommitWidth) {
+    when(
+      io.rob_commits(w).valid &&
+        CommitType.isBranch(io.rob_commits(w).bits.commitType)
+    ) {
+      lastCommittedBranchBlkAddr := getBlkAddr(io.rob_commits(w).bits.pc)
+    }
+  }
+
+  when(io.pdip_redirect.valid) {
+    pendingRedirectTriggerBlkAddr := redirectTriggerBlkAddr
+    pendingRedirectTriggerValid := true.B
+    printf(p"[PDIP2-ICache] redirect: cfiBlk=0x${Hexadecimal(redirectTriggerBlkAddr)} matchesFetch=${redirectMatchesFetch}\n")
+  }
+  when(io.fencei) {
+    pendingRedirectTriggerValid := false.B
+  }
+
+  private val learnTriggerBlkAddr = Mux(pendingRedirectTriggerValid, pendingRedirectTriggerBlkAddr, missReqVBlkAddr)
+
+  when(missReqValid) {
+    printf(p"[PDIP2-ICache] miss: missBlk=0x${Hexadecimal(missReqVBlkAddr)} pendingRedirValid=${pendingRedirectTriggerValid} pendingRedirBlk=0x${Hexadecimal(pendingRedirectTriggerBlkAddr)} learnTrigger=0x${Hexadecimal(learnTriggerBlkAddr)}\n")
+  }
+
+  private val lastMissValid = RegInit(false.B)
+  private val lastMissFtqIdx = RegInit(0.U.asTypeOf(new FtqPtr))
+  when(io.fencei || io.pdip_redirect.valid) {
+    lastMissValid := false.B
+  }.elsewhen(missReqValid) {
+    lastMissValid := true.B
+    lastMissFtqIdx := Mux(
+      missReqVec(0),
+      missUnit.io.req(0).bits.ftqIdx,
+      missUnit.io.req(1).bits.ftqIdx
+    )
+  }
+
+  fecTracker.io.newMiss.valid := missReqValid
+  fecTracker.io.newMiss.bits.blkPaddr := missReqBlkPaddr
+  fecTracker.io.newMiss.bits.vSetIdx := missReqVSetIdx
+  fecTracker.io.newMiss.bits.ftqIdx := Mux(
+    missReqVec(0),
+    missUnit.io.req(0).bits.ftqIdx,
+    missUnit.io.req(1).bits.ftqIdx
+  )
+
+  private val mshrFtqIdxReg = Reg(Vec(PortNumber, new FtqPtr))
+  for (i <- 0 until PortNumber) {
+    when(missUnit.io.req(i).fire) {
+      mshrFtqIdxReg(i) := missUnit.io.req(i).bits.ftqIdx
+    }
+  }
+  private val mshr0Active = missUnit.io.ICacheMissUnitInfo.mshr(0).valid
+  private val mshr1Active = missUnit.io.ICacheMissUnitInfo.mshr(1).valid
+  fecTracker.io.stallUpdate.valid            := mshr0Active || mshr1Active
+  fecTracker.io.stallUpdate.bits.ftqIdx     := Mux(mshr0Active, mshrFtqIdxReg(0), mshrFtqIdxReg(1))
+  fecTracker.io.stallUpdate.bits.stalled    := true.B
+  for (w <- 0 until CommitWidth) {
+    fecTracker.io.retireUpdate(w).valid := io.rob_commits(w).valid
+    fecTracker.io.retireUpdate(w).bits.ftqIdx := io.rob_commits(w).bits.ftqIdx
+  }
+  fecTracker.io.triggerAddr := learnTriggerBlkAddr
+  fecTracker.io.fencei := io.fencei
+
+  // -----------------------------------------------------------------------
+  // 2 stage PDIP pipeline
+  // Stage 0 - request + mirror read
+  // Stage 1 - hit check and issue in S1
+  // -----------------------------------------------------------------------
+  private val pdipReq       = pdipController.io.prefetchVaddr // incoming prefetch request (valid/ready/bits)
+  private val pdipS0Pending = RegInit(false.B)  // S0 fired but S1 not yet consumed
+  private val pdipS0Fire    = pdipReq.valid && pdipReq.ready // S0 handshake: request accepted this cycle
+  private val pdipS0Bits    = RegEnable(pdipReq.bits, pdipS0Fire) // latch request payload for S1 (aligned with SRAM resp)
+  private val pdipS1En      = RegNext(pdipS0Fire, false.B) // S1 enable: true when SRAM resp is valid
+
+  when(pdipS0Fire) { pdipS0Pending := true.B }
+  when(pdipS1En)   { pdipS0Pending := false.B }
+
+  // issue the read
+  mirrorTagArray.io.r.req.valid       := pdipS0Fire
+  mirrorTagArray.io.r.req.bits.setIdx := pdipReq.bits.vSetIdx
+
+
+  private val pdipS1Valid = RegInit(false.B)
+  private val pdipS1Bits  = Reg(new PrefetchEntry)
+  private val pdipS1Hit   = RegInit(false.B)
+
+  private val pdipS0Tag   = get_phy_tag(Cat(pdipS0Bits.blkPaddr, 0.U(blockOffBits.W)))
+  private val pdipHitCalc = VecInit((0 until ICacheWays).map { w =>
+    val e = mirrorTagArray.io.r.resp.data(w)
+    e.valid && (e.epoch === mirrorEpoch) && (e.tag === pdipS0Tag)
+  }).asUInt.orR
+
+  when(pdipS1En) {
+    pdipS1Valid := true.B
+    pdipS1Bits  := pdipS0Bits
+    pdipS1Hit   := pdipHitCalc
+  }
+
+  // Accept next request only when the pipeline is empty
+  pdipReq.ready := !pdipS0Pending && !pdipS1Valid
+
+  private val pdipActive     = io.csr_pf_enable && io.csr_pdip_enable
+  private val pdipMirrorHit  = pdipS1Valid && pdipS1Hit
+  private val pdipDupWithFtq = pdipS1Valid && io.prefetch.req.valid &&
+    (pdipS1Bits.blkPaddr === getBlkAddr(io.prefetch.req.bits.target))
+  private val pdipIssueValid = pdipS1Valid && pdipActive && !pdipMirrorHit && !pdipDupWithFtq
+
+  when(pdipS1Valid && (pdipMirrorHit || pdipDupWithFtq || !pdipActive)) {
+    pdipS1Valid := false.B
+  }
+
+  // Physical block address → FTQ-style virtual target
+  private val pdipFtqReqBits = Wire(new PrefetchRequest)
+  pdipFtqReqBits.target := Cat(pdipS1Bits.blkPaddr, 0.U(blockOffBits.W))
+
+  // FDIP (FTQ) has strict priority over PDIP; PDIP only fires when FTQ has nothing
+  private val useFtqPrefetch    = io.prefetch.req.valid
+  private val usePdipPrefetch   = !useFtqPrefetch && pdipIssueValid
+  private val fdipPrefetchReady = fdipPrefetch.io.ftqReq.req.ready
+
+  fdipPrefetch.io.ftqReq.req.valid       := useFtqPrefetch || usePdipPrefetch
+  fdipPrefetch.io.ftqReq.req.bits.target := Mux(useFtqPrefetch, io.prefetch.req.bits.target, pdipFtqReqBits.target)
+  io.prefetch.req.ready                  := useFtqPrefetch && fdipPrefetchReady
+
+  when(usePdipPrefetch && fdipPrefetchReady) { pdipS1Valid := false.B }
+
+  pdipController.io.trigger.valid               := fetchTriggerReqValid
+  pdipController.io.trigger.bits.blkPaddr       := fetchTriggerBlkAddr
+  pdipController.io.trigger.bits.highCostHint   := redirectMatchesFetch
+  pdipController.io.trigger.bits.controlTrigger :=
+    redirectMatchesFetch && io.pdip_redirect.bits.ControlRedirectBubble
+  pdipController.io.trigger.bits.btbMissTrigger :=
+    redirectMatchesFetch &&
+      (io.pdip_redirect.bits.ControlBTBMissBubble || io.pdip_redirect.bits.BTBMissBubble)
+  pdipController.io.fecLine          <> fecTracker.io.fecLine
+  pdipController.io.mshrThresholdMet := missUnit.io.req.map(_.ready).reduce(_ && _)
+  pdipController.io.flush            := io.fencei
+  pdipController.io.enable           := io.csr_pf_enable && io.csr_pdip_enable
+  pdipController.io.dropDupWithFtq   := pdipDupWithFtq
+
   if (prefetchToL1) {
     val meta_write_arb  = Module(new Arbiter(new ICacheMetaWriteBundle(),  2))
     meta_write_arb.io.in(0)     <> missUnit.io.meta_write
     meta_write_arb.io.in(1)     <> fdipPrefetch.io.metaWrite
     meta_write_arb.io.out       <> metaArray.io.write
-    // prefetch Meta Array. Connect meta_write_arb to ensure the data is same as metaArray
     prefetchMetaArray.io.write <> meta_write_arb.io.out
+
+    val mirrorWriteData = Wire(Vec(ICacheWays, mirrorTagGen.cloneType))
+    mirrorWriteData.foreach { e =>
+      e.valid := true.B
+      e.tag   := meta_write_arb.io.out.bits.phyTag
+      e.epoch := mirrorEpoch
+    }
+    mirrorTagArray.io.w.req.valid := meta_write_arb.io.out.fire
+    mirrorTagArray.io.w.req.bits.apply(
+      data    = mirrorWriteData,
+      setIdx  = meta_write_arb.io.out.bits.virIdx,
+      waymask = meta_write_arb.io.out.bits.waymask
+    )
   } else {
     missUnit.io.meta_write <> metaArray.io.write
     missUnit.io.meta_write <> prefetchMetaArray.io.write
-    // ensure together wirte to metaArray and prefetchMetaArray
     missUnit.io.meta_write.ready := metaArray.io.write.ready && prefetchMetaArray.io.write.ready
+
+    val mirrorWriteData = Wire(Vec(ICacheWays, mirrorTagGen.cloneType))
+    mirrorWriteData.foreach { e =>
+      e.valid := true.B
+      e.tag   := missUnit.io.meta_write.bits.phyTag
+      e.epoch := mirrorEpoch
+    }
+    mirrorTagArray.io.w.req.valid := missUnit.io.meta_write.fire
+    mirrorTagArray.io.w.req.bits.apply(
+      data    = mirrorWriteData,
+      setIdx  = missUnit.io.meta_write.bits.virIdx,
+      waymask = missUnit.io.meta_write.bits.waymask
+    )
   }
 
-  // Data Array. Priority: missUnit > fdipPrefetch
   if (prefetchToL1) {
     val data_write_arb = Module(new Arbiter(new ICacheDataWriteBundle(), 2))
     data_write_arb.io.in(0)     <> missUnit.io.data_write

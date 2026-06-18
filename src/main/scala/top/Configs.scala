@@ -34,6 +34,7 @@ import xiangshan.cache.mmu.{L2TLBParameters, TLBParameters}
 import device.{EnableJtag, XSDebugModuleParams}
 import huancun._
 import coupledL2._
+import xiangshan.mem.prefetch.SMSParams
 
 class BaseConfig(n: Int) extends Config((site, here, up) => {
   case XLen => 64
@@ -193,6 +194,54 @@ class MinimalConfig(n: Int = 1) extends Config(
         )),
         L3NBanks = 1
       )
+  })
+)
+
+class MinimalILAConfig(n: Int = 1) extends Config(
+  new MinimalConfig(n).alter((site, here, up) => {
+    case SoCParamsKey =>
+      val baseParams = up(SoCParamsKey)
+      // EnableILA + add tpmeta to L3 so L2's tpmeta_sink/source nodes have a peer.
+      // PrefetchReceiverParams hardcodes hasTPPrefetcher=true, requiring L3 tpmeta support.
+      baseParams.copy(
+        EnableILA = true,
+        L3CacheParamsOpt = baseParams.L3CacheParamsOpt.map(_.copy(
+          tpmeta = Some(huancun.prefetch.DefaultTPmetaParameters())
+        ))
+      )
+    case XSTileKey => up(XSTileKey).map(_.copy(
+      prefetcher = Some(SMSParams()),
+      // ICache hardcodes DCacheParameters().aliasBitsOpt (nSets=256 default → AliasField(2)).
+      // DCache must match: nSets=256 → blockOffBits+idxBits=6+8=14 > pgIdxBits=12 → AliasField(2).
+      dcacheParametersOpt = Some(DCacheParameters(
+        nSets = 256,
+        nWays = 8,
+        tagECC = Some("secded"),
+        dataECC = Some("secded"),
+        replacer = Some("setplru"),
+        nMissEntries = 4,
+        nProbeEntries = 4,
+        nReleaseEntries = 8,
+        nMaxPrefetchEntry = 2,
+      )),
+      // SMS prefetcher requires pf_recv_node on L2 (prefetch must be non-None).
+      // clientCaches enables alias-bit handling inside coupledL2 (aliasBitsOpt=Some(2)).
+      // sets/ways/banks kept identical to MinimalConfig; VAddrBits=39, blockOffBits=6.
+      L2CacheParamsOpt = Some(L2Param(
+        name = "L2",
+        ways = 8,
+        sets = 128,
+        clientCaches = Seq(L1Param(
+          name      = "dcache",
+          sets      = 256,   // 2 * nSets(256) / L2NBanks(2)
+          ways      = 10,    // nWays(8) + 2
+          aliasBitsOpt = Some(2),
+          vaddrBitsOpt = Some(33), // VAddrBits(39) - blockOffBits(6)
+        )),
+        echoField = Seq(huancun.DirtyField()),
+        prefetch  = Some(coupledL2.prefetch.PrefetchReceiverParams()),
+      )),
+    ))
   })
 )
 
